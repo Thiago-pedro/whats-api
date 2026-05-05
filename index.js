@@ -7,6 +7,7 @@ const {
     fetchLatestBaileysVersion
 } = require("@whiskeysockets/baileys")
 const qrcode = require("qrcode-terminal")
+const QRCode = require("qrcode")
 
 const app = express()
 const PORT = Number(process.env.PORT) || 3000
@@ -56,7 +57,7 @@ function normalizePhoneNumber(value) {
     return digitsOnly
 }
 
-app.use(["/start", "/send"], authMiddleware)
+app.use(["/start", "/send", "/qr"], authMiddleware)
 
 // armazena sessões ativas
 const sessions = {}
@@ -79,7 +80,9 @@ async function startSession(sessionId) {
             sessions[sessionId] = {
                 sock: null,
                 connected: false,
-                starting: true
+                starting: true,
+                qrCode: null,
+                qrUpdatedAt: null
             }
         }
 
@@ -95,6 +98,8 @@ async function startSession(sessionId) {
             if (qr) {
                 if (sessions[sessionId]) {
                     sessions[sessionId].starting = false
+                    sessions[sessionId].qrCode = await QRCode.toDataURL(qr)
+                    sessions[sessionId].qrUpdatedAt = new Date().toISOString()
                 }
                 console.log(`\n📲 QR da sessão ${sessionId}:`)
                 qrcode.generate(qr, { small: true })
@@ -105,6 +110,8 @@ async function startSession(sessionId) {
                 if (sessions[sessionId]) {
                     sessions[sessionId].connected = true
                     sessions[sessionId].starting = false
+                    sessions[sessionId].qrCode = null
+                    sessions[sessionId].qrUpdatedAt = null
                 }
                 console.log(`✅ Sessão ${sessionId} conectada`)
             }
@@ -114,6 +121,8 @@ async function startSession(sessionId) {
                 console.log(`❌ Sessão ${sessionId} desconectada`)
                 if (sessions[sessionId]) {
                     sessions[sessionId].connected = false
+                    sessions[sessionId].qrCode = null
+                    sessions[sessionId].qrUpdatedAt = null
                 }
 
                 const statusCode = lastDisconnect?.error?.output?.statusCode
@@ -191,7 +200,9 @@ app.get("/start", async (req, res) => {
     sessions[sessionId] = {
         sock: null,
         connected: false,
-        starting: true
+        starting: true,
+        qrCode: null,
+        qrUpdatedAt: null
     }
 
     startSession(sessionId)
@@ -250,6 +261,54 @@ app.post("/send", async (req, res) => {
         console.log(err)
         return sendError(res, 500, "falha ao enviar")
     }
+})
+
+app.get("/qr", (req, res) => {
+    const sessionId = req.query.session?.toString()
+
+    if (!isValidSessionId(sessionId)) {
+        return sendError(res, 400, "session invalida")
+    }
+
+    const sessionData = sessions[sessionId]
+    if (!sessionData) {
+        return sendError(res, 404, "sessao nao encontrada")
+    }
+
+    if (sessionData.connected) {
+        return sendSuccess(res, 200, {
+            session: sessionId,
+            connected: true,
+            message: "sessao conectada, nao precisa de qr"
+        })
+    }
+
+    if (!sessionData.qrCode) {
+        return sendError(res, 404, "qr indisponivel no momento, tente novamente em alguns segundos")
+    }
+
+    return res.status(200).send(`<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>QR da sessao ${sessionId}</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 24px; text-align: center; background: #0f172a; color: #e2e8f0; }
+    .card { max-width: 520px; margin: 0 auto; background: #1e293b; border-radius: 12px; padding: 20px; }
+    img { width: 100%; max-width: 420px; height: auto; background: #fff; border-radius: 8px; padding: 10px; }
+    .meta { margin-top: 12px; font-size: 14px; color: #94a3b8; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>Escaneie o QR da sessao: ${sessionId}</h2>
+    <img src="${sessionData.qrCode}" alt="QR Code WhatsApp" />
+    <p class="meta">Atualizado em: ${sessionData.qrUpdatedAt || "agora"}</p>
+    <p class="meta">Se nao funcionar, recarregue esta pagina para pegar um QR novo.</p>
+  </div>
+</body>
+</html>`)
 })
 
 app.get("/health", (req, res) => {

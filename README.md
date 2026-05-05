@@ -27,6 +27,7 @@ As rotas protegidas exigem header:
 
 - `GET /health` (sem auth)
 - `GET /start?session=nome_sessao` (com auth)
+- `GET /qr?session=nome_sessao` (com auth)
 - `POST /send` (com auth)
 
 ### Payload `/send`

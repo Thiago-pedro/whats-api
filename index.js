@@ -156,7 +156,7 @@ async function startSession(sessionId) {
                 postLovableWebhook({
                     event: "messages.upsert",
                     sessionId,
-                    direction: msg.key.fromMe ? "out" : "in",
+                    fromMe: !!msg.key.fromMe,
                     from: msg.key.remoteJid,
                     text,
                     timestamp: msg.messageTimestamp,
@@ -172,9 +172,10 @@ async function startSession(sessionId) {
                 postLovableWebhook({
                     event: "messages.update",
                     sessionId,
-                    messageId: u.key.id,
-                    remoteJid: u.key.remoteJid,
                     fromMe: !!u.key.fromMe,
+                    from: u.key.remoteJid,
+                    messageId: u.key.id,
+                    timestamp: u.update?.messageTimestamp,
                     status: u.update?.status
                 })
             }

@@ -1,1 +1,273 @@
-require("./api")
+const express = require("express")
+const cors = require("cors")
+require("dotenv").config()
+const {
+    default: makeWASocket,
+    useMultiFileAuthState,
+    fetchLatestBaileysVersion
+} = require("@whiskeysockets/baileys")
+const qrcode = require("qrcode-terminal")
+const QRCode = require("qrcode")
+
+const app = express()
+const PORT = Number(process.env.PORT) || 3000
+const API_KEY = process.env.API_KEY
+const CORS_ORIGIN = process.env.CORS_ORIGIN || "*"
+
+app.use(express.json())
+app.use(cors({ origin: CORS_ORIGIN === "*" ? true : CORS_ORIGIN }))
+
+if (!API_KEY) {
+    console.error("❌ API_KEY não definida no .env")
+    process.exit(1)
+}
+
+function sendError(res, statusCode, message) {
+    return res.status(statusCode).json({
+        ok: false,
+        error: message
+    })
+}
+
+function sendSuccess(res, statusCode, data) {
+    return res.status(statusCode).json({
+        ok: true,
+        data
+    })
+}
+
+function authMiddleware(req, res, next) {
+    const apiKey = req.headers["x-api-key"]
+
+    if (!apiKey || apiKey !== API_KEY) {
+        return sendError(res, 401, "nao autorizado")
+    }
+
+    next()
+}
+
+function isValidSessionId(sessionId) {
+    return typeof sessionId === "string" && /^[a-zA-Z0-9_-]{3,60}$/.test(sessionId)
+}
+
+function normalizePhoneNumber(value) {
+    if (typeof value !== "string") return null
+    const digitsOnly = value.replace(/\D/g, "")
+    if (digitsOnly.length < 10 || digitsOnly.length > 15) return null
+    return digitsOnly
+}
+
+app.use(["/start", "/send", "/qr"], authMiddleware)
+
+const sessions = {}
+
+async function startSession(sessionId) {
+    try {
+        const { state, saveCreds } = await useMultiFileAuthState(`auth/${sessionId}`)
+        const { version } = await fetchLatestBaileysVersion()
+
+        const sock = makeWASocket({
+            auth: state,
+            version,
+            browser: ["Ubuntu", "Chrome", "20.0.04"]
+        })
+
+        if (!sessions[sessionId]) {
+            sessions[sessionId] = {
+                sock: null,
+                connected: false,
+                starting: true,
+                qrCode: null,
+                qrUpdatedAt: null
+            }
+        }
+
+        sessions[sessionId].sock = sock
+        sessions[sessionId].connected = false
+
+        sock.ev.on("creds.update", saveCreds)
+
+        sock.ev.on("connection.update", async (update) => {
+            const { connection, qr, lastDisconnect } = update
+
+            if (qr) {
+                if (sessions[sessionId]) {
+                    sessions[sessionId].starting = false
+                    sessions[sessionId].qrCode = await QRCode.toDataURL(qr)
+                    sessions[sessionId].qrUpdatedAt = new Date().toISOString()
+                }
+                console.log(`\n📲 QR da sessão ${sessionId}:`)
+                qrcode.generate(qr, { small: true })
+            }
+
+            if (connection === "open") {
+                if (sessions[sessionId]) {
+                    sessions[sessionId].connected = true
+                    sessions[sessionId].starting = false
+                    sessions[sessionId].qrCode = null
+                    sessions[sessionId].qrUpdatedAt = null
+                }
+                console.log(`✅ Sessão ${sessionId} conectada`)
+            }
+
+            if (connection === "close") {
+                console.log(`❌ Sessão ${sessionId} desconectada`)
+                if (sessions[sessionId]) {
+                    sessions[sessionId].connected = false
+                    sessions[sessionId].qrCode = null
+                    sessions[sessionId].qrUpdatedAt = null
+                }
+
+                const statusCode = lastDisconnect?.error?.output?.statusCode
+
+                if (statusCode !== 401) {
+                    console.log("🔄 Tentando reconectar...")
+                    if (sessions[sessionId]) {
+                        sessions[sessionId].starting = true
+                    }
+                    setTimeout(() => startSession(sessionId), 2000)
+                } else {
+                    console.log("🚫 Sessão deslogada, precisa escanear QR novamente")
+                    delete sessions[sessionId]
+                }
+            }
+        })
+    } catch (error) {
+        console.log(`❌ Falha ao iniciar sessão ${sessionId}:`, error?.message || error)
+        delete sessions[sessionId]
+    }
+}
+
+app.get("/start", async (req, res) => {
+    const sessionId = req.query.session?.toString()
+
+    if (!isValidSessionId(sessionId)) {
+        return sendError(res, 400, "session invalida. use 3-60 caracteres: letras, numeros, _ ou -")
+    }
+
+    if (sessions[sessionId]) {
+        return sendSuccess(res, 200, { message: "sessao ja iniciada", session: sessionId })
+    }
+
+    sessions[sessionId] = {
+        sock: null,
+        connected: false,
+        starting: true,
+        qrCode: null,
+        qrUpdatedAt: null
+    }
+
+    startSession(sessionId)
+
+    return sendSuccess(res, 202, {
+        message: "sessao iniciada",
+        session: sessionId
+    })
+})
+
+app.post("/send", async (req, res) => {
+    const { session, numero, mensagem } = req.body || {}
+
+    if (!isValidSessionId(session)) {
+        return sendError(res, 400, "session invalida")
+    }
+
+    const normalizedNumber = normalizePhoneNumber(numero)
+    if (!normalizedNumber) {
+        return sendError(res, 400, "numero invalido")
+    }
+
+    if (typeof mensagem !== "string" || mensagem.trim().length === 0 || mensagem.length > 4000) {
+        return sendError(res, 400, "mensagem invalida")
+    }
+
+    const sessionData = sessions[session]
+    const sock = sessionData?.sock
+
+    if (!sessionData) {
+        return sendError(res, 404, "sessao nao encontrada")
+    }
+
+    if (sessionData.starting || !sock) {
+        return sendError(res, 409, "sessao inicializando, aguarde alguns segundos")
+    }
+
+    if (!sessionData.connected) {
+        return sendError(res, 409, "sessao iniciada, mas ainda nao conectada ao whatsapp")
+    }
+
+    try {
+        await sock.sendMessage(normalizedNumber + "@s.whatsapp.net", {
+            text: mensagem.trim()
+        })
+
+        return sendSuccess(res, 200, {
+            status: "enviado",
+            session,
+            numero: normalizedNumber
+        })
+    } catch (err) {
+        console.log(err)
+        return sendError(res, 500, "falha ao enviar")
+    }
+})
+
+app.get("/qr", (req, res) => {
+    const sessionId = req.query.session?.toString()
+
+    if (!isValidSessionId(sessionId)) {
+        return sendError(res, 400, "session invalida")
+    }
+
+    const sessionData = sessions[sessionId]
+    if (!sessionData) {
+        return sendError(res, 404, "sessao nao encontrada")
+    }
+
+    if (sessionData.connected) {
+        return sendSuccess(res, 200, {
+            session: sessionId,
+            connected: true,
+            message: "sessao conectada, nao precisa de qr"
+        })
+    }
+
+    if (!sessionData.qrCode) {
+        return sendError(res, 404, "qr indisponivel no momento, tente novamente em alguns segundos")
+    }
+
+    return res.status(200).send(`<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>QR da sessao ${sessionId}</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 24px; text-align: center; background: #0f172a; color: #e2e8f0; }
+    .card { max-width: 520px; margin: 0 auto; background: #1e293b; border-radius: 12px; padding: 20px; }
+    img { width: 100%; max-width: 420px; height: auto; background: #fff; border-radius: 8px; padding: 10px; }
+    .meta { margin-top: 12px; font-size: 14px; color: #94a3b8; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>Escaneie o QR da sessao: ${sessionId}</h2>
+    <img src="${sessionData.qrCode}" alt="QR Code WhatsApp" />
+    <p class="meta">Atualizado em: ${sessionData.qrUpdatedAt || "agora"}</p>
+    <p class="meta">Se nao funcionar, recarregue esta pagina para pegar um QR novo.</p>
+  </div>
+</body>
+</html>`)
+})
+
+app.get("/health", (req, res) => {
+    return sendSuccess(res, 200, {
+        status: "up",
+        uptimeSeconds: Math.floor(process.uptime()),
+        activeSessions: Object.keys(sessions).length
+    })
+})
+
+app.listen(PORT, () => {
+    console.log(`🚀 API rodando em http://localhost:${PORT}`)
+})

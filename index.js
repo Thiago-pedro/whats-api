@@ -57,9 +57,31 @@ function normalizePhoneNumber(value) {
     return digitsOnly
 }
 
-app.use(["/start", "/send", "/qr"], authMiddleware)
+app.use(["/start", "/send", "/qr", "/session"], authMiddleware)
 
 const sessions = {}
+
+function closeSocketSafely(sock) {
+    if (!sock) return
+    try {
+        if (typeof sock.ws?.close === "function") {
+            sock.ws.close()
+        }
+        if (typeof sock.end === "function") {
+            sock.end()
+        }
+    } catch (error) {
+        console.log("⚠️ Falha ao encerrar socket:", error?.message || error)
+    }
+}
+
+function resetSession(sessionId) {
+    const existing = sessions[sessionId]
+    if (!existing) return false
+    closeSocketSafely(existing.sock)
+    delete sessions[sessionId]
+    return true
+}
 
 async function startSession(sessionId) {
     try {
@@ -121,6 +143,9 @@ async function startSession(sessionId) {
                 const statusCode = lastDisconnect?.error?.output?.statusCode
 
                 if (statusCode !== 401) {
+                    if (sessions[sessionId]?.sock !== sock) {
+                        return
+                    }
                     console.log("🔄 Tentando reconectar...")
                     if (sessions[sessionId]) {
                         sessions[sessionId].starting = true
@@ -140,13 +165,18 @@ async function startSession(sessionId) {
 
 app.get("/start", async (req, res) => {
     const sessionId = req.query.session?.toString()
+    const forceStart = req.query.force?.toString() === "1"
 
     if (!isValidSessionId(sessionId)) {
         return sendError(res, 400, "session invalida. use 3-60 caracteres: letras, numeros, _ ou -")
     }
 
     if (sessions[sessionId]) {
-        return sendSuccess(res, 200, { message: "sessao ja iniciada", session: sessionId })
+        if (!forceStart) {
+            return sendSuccess(res, 200, { message: "sessao ja iniciada", session: sessionId })
+        }
+        console.log(`🔁 Reinicio forcado da sessao ${sessionId}`)
+        resetSession(sessionId)
     }
 
     sessions[sessionId] = {
@@ -159,8 +189,33 @@ app.get("/start", async (req, res) => {
 
     startSession(sessionId)
 
+    if (forceStart) {
+        return sendSuccess(res, 202, {
+            message: "sessao reiniciada",
+            session: sessionId
+        })
+    }
+
     return sendSuccess(res, 202, {
         message: "sessao iniciada",
+        session: sessionId
+    })
+})
+
+app.delete("/session", (req, res) => {
+    const sessionId = req.query.session?.toString()
+
+    if (!isValidSessionId(sessionId)) {
+        return sendError(res, 400, "session invalida")
+    }
+
+    const removed = resetSession(sessionId)
+    if (!removed) {
+        return sendError(res, 404, "sessao nao encontrada")
+    }
+
+    return sendSuccess(res, 200, {
+        message: "sessao removida",
         session: sessionId
     })
 })

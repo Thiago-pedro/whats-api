@@ -1,10 +1,13 @@
 const express = require("express")
 const cors = require("cors")
+const axios = require("axios")
 require("dotenv").config()
 const {
     default: makeWASocket,
     useMultiFileAuthState,
-    fetchLatestBaileysVersion
+    fetchLatestBaileysVersion,
+    extractMessageContent,
+    getContentType
 } = require("@whiskeysockets/baileys")
 const qrcode = require("qrcode-terminal")
 const QRCode = require("qrcode")
@@ -55,6 +58,39 @@ function normalizePhoneNumber(value) {
     const digitsOnly = value.replace(/\D/g, "")
     if (digitsOnly.length < 10 || digitsOnly.length > 15) return null
     return digitsOnly
+}
+
+function getMessagePreviewText(msg) {
+    try {
+        const extracted = extractMessageContent(msg?.message)
+        if (!extracted) return ""
+        const type = getContentType(extracted)
+        if (!type) return ""
+        const part = extracted[type]
+        if (type === "conversation" && typeof part === "string") return part
+        if (part && typeof part === "object") {
+            if (typeof part.text === "string") return part.text
+            if (typeof part.caption === "string") return part.caption
+        }
+        return ""
+    } catch {
+        return ""
+    }
+}
+
+async function postLovableWebhook(payload) {
+    const url = process.env.LOVABLE_EVENTS_URL
+    if (!url || typeof url !== "string") return
+
+    const secret = process.env.LOVABLE_WEBHOOK_SECRET
+    const headers = { "Content-Type": "application/json" }
+    if (secret) headers["x-webhook-secret"] = secret
+
+    try {
+        await axios.post(url.trim(), payload, { timeout: 15000, headers })
+    } catch (error) {
+        console.log("⚠️ LOVABLE webhook falhou:", error?.message || error)
+    }
 }
 
 app.use(["/start", "/send", "/qr", "/session"], authMiddleware)
@@ -109,8 +145,53 @@ async function startSession(sessionId) {
 
         sock.ev.on("creds.update", saveCreds)
 
+        sock.ev.on("messages.upsert", ({ messages, type }) => {
+            if (type === "append") return
+
+            for (const msg of messages || []) {
+                if (!msg?.key) continue
+                if (msg.key.remoteJid === "status@broadcast") continue
+
+                const text = getMessagePreviewText(msg)
+                postLovableWebhook({
+                    event: "messages.upsert",
+                    sessionId,
+                    direction: msg.key.fromMe ? "out" : "in",
+                    from: msg.key.remoteJid,
+                    text,
+                    timestamp: msg.messageTimestamp,
+                    messageId: msg.key.id,
+                    upsertType: type
+                })
+            }
+        })
+
+        sock.ev.on("messages.update", (updates) => {
+            for (const u of updates || []) {
+                if (!u?.key) continue
+                postLovableWebhook({
+                    event: "messages.update",
+                    sessionId,
+                    messageId: u.key.id,
+                    remoteJid: u.key.remoteJid,
+                    fromMe: !!u.key.fromMe,
+                    status: u.update?.status
+                })
+            }
+        })
+
         sock.ev.on("connection.update", async (update) => {
             const { connection, qr, lastDisconnect } = update
+
+            if (connection !== undefined || lastDisconnect !== undefined) {
+                postLovableWebhook({
+                    event: "connection.update",
+                    sessionId,
+                    connection: connection ?? null,
+                    hasQr: !!qr,
+                    disconnectStatusCode: lastDisconnect?.error?.output?.statusCode ?? null
+                })
+            }
 
             if (qr) {
                 if (sessions[sessionId]) {

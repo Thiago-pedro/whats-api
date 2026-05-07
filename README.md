@@ -1,34 +1,57 @@
-# WhatsApp API Backend
+# WhatsApp API Backend (API + Worker)
 
-Backend em Node.js (Express + Baileys) pronto para integrar com frontend no Lovable.
+Backend em Node.js (Express + Baileys) com arquitetura desacoplada:
+
+- **API** stateless para receber requests e enfileirar jobs
+- **Worker** para manter conexoes WhatsApp e processar envios
+- **Redis** para fila e estado de sessao
+- **Postgres** opcional para auditoria e snapshots de sessao
 
 ## Configuracao
 
 1. Copie `.env.example` para `.env`
 2. Defina uma `API_KEY` forte
-3. (Opcional) Defina `CORS_ORIGIN` com a URL do app no Lovable
+3. Defina `REDIS_URL`
+4. (Opcional) Defina `DATABASE_URL` para auditoria
+5. Ajuste `MAX_SESSIONS_PER_TENANT` conforme seu plano
+
+## Variaveis de ambiente
+
+- `PORT=3000`
+- `API_KEY=...`
+- `CORS_ORIGIN=*`
+- `REDIS_URL=redis://127.0.0.1:6379`
+- `DATABASE_URL=` (opcional)
+- `QUEUE_NAME=whatsapp-jobs`
+- `MAX_SESSIONS_PER_TENANT=2`
+- `AUTH_BASE_PATH=auth`
+- `WORKER_ID=worker-1`
 
 ## Rodando localmente
 
 ```bash
 npm install
+npm run worker
 npm start
 ```
 
-API disponivel em `http://localhost:3000`.
+- API em `http://localhost:3000`
+- Worker processa fila e mantem sockets WhatsApp
 
-## Autenticacao
+## Autenticacao e tenant
 
-As rotas protegidas exigem header:
+Rotas protegidas exigem headers:
 
-`x-api-key: SUA_API_KEY`
+- `x-api-key: SUA_API_KEY`
+- `x-tenant-id: id_do_tenant` (se omitido, usa `default`)
 
 ## Endpoints
 
 - `GET /health` (sem auth)
-- `GET /start?session=nome_sessao` (com auth)
-- `GET /qr?session=nome_sessao` (com auth)
-- `POST /send` (com auth)
+- `GET /start?session=nome_sessao` (com auth + tenant)
+- `GET /session?session=nome_sessao` (com auth + tenant)
+- `GET /qr?session=nome_sessao` (com auth + tenant)
+- `POST /send` (com auth + tenant)
 
 ### Payload `/send`
 
@@ -40,17 +63,19 @@ As rotas protegidas exigem header:
 }
 ```
 
-## Respostas principais
+## Comportamento de escala implementado
 
-- `401`: api key invalida/ausente
-- `400`: validacao de dados
-- `404`: sessao nao encontrada
-- `409`: sessao inicializando ou nao conectada
-- `200`: mensagem enviada
+- Limite por tenant em `/start` (`MAX_SESSIONS_PER_TENANT`)
+- Sessao isolada por tenant
+- Estado da sessao fora da memoria local (Redis)
+- Envio assíncrono em fila (`/send` responde `202 enfileirado`)
 
-## Fluxo recomendado para Lovable
+## Deploy (Render)
 
-1. Chamar `GET /start?session=<id_cliente>`
-2. Escanear QR no terminal do backend
-3. Aguardar conexao da sessao
-4. Chamar `POST /send` para envio de mensagens
+Para producao, crie ao menos dois servicos:
+
+1. **API service**: comando `npm start`
+2. **Worker service**: comando `npm run worker`
+
+Ambos devem compartilhar o mesmo `REDIS_URL` e `API_KEY`.
+Use disco persistente para `AUTH_BASE_PATH` se quiser manter login entre reinicios.

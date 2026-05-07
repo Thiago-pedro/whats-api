@@ -1,10 +1,11 @@
 {
   "name": "whatsapp-api",
   "version": "1.0.0",
-  "main": "index.js",
+  "main": "api.js",
   "scripts": {
-    "start": "node index.js",
-    "dev": "node index.js",
+    "start": "node api.js",
+    "dev": "node api.js",
+    "worker": "node worker.js",
     "test": "echo \"No automated tests configured\""
   },
   "keywords": [],
@@ -14,9 +15,12 @@
   "dependencies": {
     "@whiskeysockets/baileys": "^7.0.0-rc.9",
     "axios": "^1.16.0",
+    "bullmq": "^5.76.6",
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
+    "ioredis": "^5.10.1",
+    "pg": "^8.20.0",
     "qrcode": "^1.5.4",
     "qrcode-terminal": "^0.12.0"
   }

@@ -12,9 +12,15 @@ const { connection } = require("./lib/redis")
 const { updateSession, getSession, registerEvent } = require("./lib/sessionStore")
 const { initDb } = require("./lib/db")
 
+function jsonSafeStringify(obj) {
+    return JSON.stringify(obj, (_k, v) => (typeof v === "bigint" ? v.toString() : v))
+}
+
 async function postLovableWebhook(payload) {
     const url = process.env.LOVABLE_EVENTS_URL
     if (!url) return
+
+    console.log("[WEBHOOK OUT]", jsonSafeStringify(payload))
 
     try {
         const headers = {
@@ -28,53 +34,73 @@ async function postLovableWebhook(payload) {
         await fetch(url, {
             method: "POST",
             headers,
-            body: JSON.stringify(payload)
+            body: jsonSafeStringify(payload)
         })
     } catch (error) {
         console.log("⚠️ LOVABLE webhook falhou:", error?.message || error)
     }
 }
 
-async function resolveJid(sock, jid) {
+function toDigitsPn(jidLike) {
+    if (jidLike == null || jidLike === "") return null
+    const head = String(jidLike).split("@")[0].split(":")[0]
+    const digits = head.replace(/\D/g, "")
+    return digits || null
+}
+
+async function resolveJidToPn(sock, jid) {
     if (!jid) return null
-    if (jid.endsWith("@lid")) {
+    const j = String(jid)
+    if (j.endsWith("@lid")) {
         try {
             const pn = await sock.signalRepository?.lidMapping?.getPNForLID?.(jid)
-            if (pn) return pn.split("@")[0].split(":")[0]
+            if (pn) return toDigitsPn(pn)
         } catch (e) {
             console.error("lid resolve fail", e)
         }
-        return jid.split("@")[0]
+        return null
     }
-    return jid.split("@")[0].split(":")[0]
+    return toDigitsPn(j)
 }
 
-function withLovableConnectionPayload(payload, sessionId, sock) {
-    const pn = sock.user?.id?.split("@")[0]?.split(":")[0]
+function buildConnectionWebhookPayload(sessionId, sock, status) {
+    const userId = sock.user?.id
     return {
-        ...payload,
-        session: sessionId,
         sessionId,
-        phone_number: pn,
-        me: pn,
-        sockUserId: sock.user?.id ?? null
+        type: "connection",
+        status,
+        phone_number: userId?.split("@")[0]?.split(":")[0],
+        me: userId,
+        sockUserId: userId
     }
 }
 
-function withLovableMessagePayload(payload, sessionId, sock, instancePn, from, to) {
+function buildMessageWebhookPayload(sessionId, sock, params) {
+    const userId = sock.user?.id
+    const {
+        direction,
+        fromDigits,
+        toDigits,
+        text,
+        message_id,
+        timestamp
+    } = params
     return {
-        ...payload,
-        session: sessionId,
         sessionId,
-        from,
-        to,
-        senderPn: from,
-        recipientPn: to,
-        fromPn: from,
-        toPn: to,
-        me: instancePn,
-        sockUserId: sock.user?.id ?? null,
-        phone_number: instancePn
+        type: "message",
+        direction,
+        from: fromDigits,
+        to: toDigits,
+        senderPn: fromDigits,
+        recipientPn: toDigits,
+        fromPn: fromDigits,
+        toPn: toDigits,
+        me: userId,
+        phone_number: userId?.split("@")[0]?.split(":")[0],
+        sockUserId: userId,
+        text,
+        message_id,
+        timestamp
     }
 }
 
@@ -131,16 +157,7 @@ async function startSession(sessionId, tenantId) {
                 lastError: null
             })
             await registerEvent(sessionId, tenantId, "connected")
-            postLovableWebhook(
-                withLovableConnectionPayload(
-                    {
-                        event: "connection.update",
-                        status: "connected"
-                    },
-                    sessionId,
-                    sock
-                )
-            )
+            postLovableWebhook(buildConnectionWebhookPayload(sessionId, sock, "open"))
             console.log(`✅ Sessao ${sessionId} conectada`)
         }
 
@@ -162,13 +179,10 @@ async function startSession(sessionId, tenantId) {
                 loggedOut
             })
             postLovableWebhook(
-                withLovableConnectionPayload(
-                    {
-                        event: "connection.update",
-                        status: loggedOut ? "logged_out" : "disconnected"
-                    },
+                buildConnectionWebhookPayload(
                     sessionId,
-                    sock
+                    sock,
+                    loggedOut ? "logged_out" : "disconnected"
                 )
             )
 
@@ -195,29 +209,38 @@ async function startSession(sessionId, tenantId) {
                 msg.message.extendedTextMessage?.text ||
                 "[mensagem nao suportada]"
 
-            const instancePn = await resolveJid(sock, sock.user?.id)
-            const peerJid =
-                msg.key.senderPn ||
-                msg.key.participant ||
-                msg.key.remoteJid
-            const resolvedPeer = await resolveJid(sock, peerJid)
-            const resolvedRemote = await resolveJid(sock, msg.key.remoteJid)
+            const instanceDigits = await resolveJidToPn(sock, sock.user?.id)
+            const isGroup = msg.key.remoteJid?.endsWith("@g.us")
 
-            let from
-            let to
+            let peerDigits
+            if (isGroup) {
+                peerDigits =
+                    (await resolveJidToPn(sock, msg.key.senderPn)) ||
+                    (await resolveJidToPn(sock, msg.key.participant))
+            } else {
+                peerDigits =
+                    (await resolveJidToPn(sock, msg.key.senderPn)) ||
+                    (await resolveJidToPn(sock, msg.key.participant)) ||
+                    (await resolveJidToPn(sock, msg.key.remoteJid))
+            }
+
+            const remoteChatDigits = await resolveJidToPn(sock, msg.key.remoteJid)
+
+            let fromDigits
+            let toDigits
             let direction
 
             if (msg.key.fromMe) {
-                from = instancePn
-                to = resolvedRemote
-                direction = "out"
+                fromDigits = instanceDigits
+                toDigits = isGroup ? remoteChatDigits : peerDigits
+                direction = "outbound"
             } else {
-                from = resolvedPeer
-                to = instancePn
-                direction = "in"
+                fromDigits = peerDigits
+                toDigits = instanceDigits
+                direction = "inbound"
             }
 
-            const numeroLog = msg.key.fromMe ? to : from
+            const numeroLog = msg.key.fromMe ? toDigits || "" : fromDigits || ""
 
             if (!msg.key.fromMe) {
                 await registerEvent(sessionId, tenantId, "incoming_message", {
@@ -227,21 +250,14 @@ async function startSession(sessionId, tenantId) {
             }
 
             postLovableWebhook(
-                withLovableMessagePayload(
-                    {
-                        event: "messages.upsert",
-                        fromMe: !!msg.key.fromMe,
-                        direction,
-                        text: texto,
-                        messageId: msg.key.id,
-                        timestamp: msg.messageTimestamp
-                    },
-                    sessionId,
-                    sock,
-                    instancePn,
-                    from,
-                    to
-                )
+                buildMessageWebhookPayload(sessionId, sock, {
+                    direction,
+                    fromDigits,
+                    toDigits,
+                    text: texto,
+                    message_id: msg.key.id,
+                    timestamp: msg.messageTimestamp
+                })
             )
 
             console.log("📩 Nova mensagem", {
@@ -270,26 +286,23 @@ async function sendMessage({ sessionId, tenantId, numero, mensagem }) {
         throw new Error("sessao conectada em outro worker ou nao inicializada localmente")
     }
 
-    await sock.sendMessage(`${numero}@s.whatsapp.net`, { text: mensagem })
+    const sent = await sock.sendMessage(`${numero}@s.whatsapp.net`, {
+        text: mensagem
+    })
     await registerEvent(sessionId, tenantId, "message_sent", { numero })
-    const instancePn = await resolveJid(sock, sock.user?.id)
-    const toResolved = await resolveJid(sock, `${numero}@s.whatsapp.net`)
-    const toVal = toResolved || numero
+    const instanceDigits = await resolveJidToPn(sock, sock.user?.id)
+    const toDigits =
+        (await resolveJidToPn(sock, `${numero}@s.whatsapp.net`)) ||
+        toDigitsPn(numero)
     postLovableWebhook(
-        withLovableMessagePayload(
-            {
-                event: "messages.upsert",
-                fromMe: true,
-                direction: "out",
-                text: mensagem,
-                timestamp: Math.floor(Date.now() / 1000)
-            },
-            sessionId,
-            sock,
-            instancePn,
-            instancePn,
-            toVal
-        )
+        buildMessageWebhookPayload(sessionId, sock, {
+            direction: "outbound",
+            fromDigits: instanceDigits,
+            toDigits,
+            text: mensagem,
+            message_id: sent?.key?.id ?? null,
+            timestamp: Math.floor(Date.now() / 1000)
+        })
     )
 }
 

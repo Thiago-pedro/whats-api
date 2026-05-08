@@ -35,6 +35,20 @@ async function postLovableWebhook(payload) {
     }
 }
 
+async function resolveJid(sock, jid) {
+    if (!jid) return null
+    if (jid.endsWith("@lid")) {
+        try {
+            const pn = await sock.signalRepository?.lidMapping?.getPNForLID?.(jid)
+            if (pn) return pn.split("@")[0].split(":")[0]
+        } catch (e) {
+            console.error("lid resolve fail", e)
+        }
+        return jid.split("@")[0]
+    }
+    return jid.split("@")[0].split(":")[0]
+}
+
 const sockets = new Map()
 
 async function startSession(sessionId, tenantId) {
@@ -88,14 +102,11 @@ async function startSession(sessionId, tenantId) {
                 lastError: null
             })
             await registerEvent(sessionId, tenantId, "connected")
-            const rawId = sock.user?.id ?? ""
-            const phoneNumber =
-                rawId.split("@")[0].split(":")[0].replace(/\D/g, "") || null
             postLovableWebhook({
                 event: "connection.update",
                 session: sessionId,
                 status: "connected",
-                phone_number: phoneNumber
+                phone_number: sock.user?.id?.split("@")[0]?.split(":")[0]
             })
             console.log(`✅ Sessao ${sessionId} conectada`)
         }
@@ -141,31 +152,61 @@ async function startSession(sessionId, tenantId) {
         for (const msg of messages || []) {
             if (!msg?.message) continue
 
-            let numero = msg.key.remoteJid || ""
-            if (numero.includes("@s.whatsapp.net")) numero = numero.replace("@s.whatsapp.net", "")
-            if (numero.includes("@lid")) numero = "Numero oculto (LID)"
-
             const texto =
                 msg.message.conversation ||
                 msg.message.extendedTextMessage?.text ||
                 "[mensagem nao suportada]"
 
+            const instancePn = await resolveJid(sock, sock.user?.id)
+            const peerJid =
+                msg.key.senderPn ||
+                msg.key.participant ||
+                msg.key.remoteJid
+            const resolvedPeer = await resolveJid(sock, peerJid)
+            const resolvedRemote = await resolveJid(sock, msg.key.remoteJid)
+
+            let from
+            let to
+            let direction
+
+            if (msg.key.fromMe) {
+                from = instancePn
+                to = resolvedRemote
+                direction = "out"
+            } else {
+                from = resolvedPeer
+                to = instancePn
+                direction = "in"
+            }
+
+            const numeroLog = msg.key.fromMe ? to : from
+
             if (!msg.key.fromMe) {
-                await registerEvent(sessionId, tenantId, "incoming_message", { numero, texto })
+                await registerEvent(sessionId, tenantId, "incoming_message", {
+                    numero: numeroLog || "",
+                    texto
+                })
             }
 
             postLovableWebhook({
                 event: "messages.upsert",
                 session: sessionId,
-                from: msg.key.fromMe ? undefined : numero,
-                to: msg.key.fromMe ? numero : undefined,
+                from,
+                to,
                 fromMe: !!msg.key.fromMe,
+                direction,
                 text: texto,
                 messageId: msg.key.id,
                 timestamp: msg.messageTimestamp
             })
 
-            console.log("📩 Nova mensagem", { sessionId, numero, fromMe: !!msg.key.fromMe, texto })
+            console.log("📩 Nova mensagem", {
+                sessionId,
+                numero: numeroLog,
+                fromMe: !!msg.key.fromMe,
+                direction,
+                texto
+            })
         }
     })
 }
@@ -187,11 +228,15 @@ async function sendMessage({ sessionId, tenantId, numero, mensagem }) {
 
     await sock.sendMessage(`${numero}@s.whatsapp.net`, { text: mensagem })
     await registerEvent(sessionId, tenantId, "message_sent", { numero })
+    const instancePn = await resolveJid(sock, sock.user?.id)
+    const toResolved = await resolveJid(sock, `${numero}@s.whatsapp.net`)
     postLovableWebhook({
         event: "messages.upsert",
         session: sessionId,
-        to: numero,
+        from: instancePn,
+        to: toResolved || numero,
         fromMe: true,
+        direction: "out",
         text: mensagem,
         timestamp: Math.floor(Date.now() / 1000)
     })

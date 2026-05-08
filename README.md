@@ -1,15 +1,36 @@
 # WhatsApp API Backend
 
-Backend em Node.js (Express + Baileys) em modo simples de 1 servico
-(API + conexao WhatsApp no mesmo processo), ideal para MVP e primeiros clientes.
+Backend em Node.js (Express + Baileys) com dois modos de execucao.
+
+## Modo oficial (recomendado agora)
+
+`index.js` (API + conexao WhatsApp no mesmo processo).
+
+Este e o modo padrao do projeto e o usado por `npm start` (ideal para fase de testes com Lovable e deploy simples no Render).
+
+## Modo alternativo (futuro/escala)
+
+`api.js` + `worker.js` (API separada do processamento com fila/Redis).
+
+Use este modo quando quiser escalar para maior volume de sessoes e processamento desacoplado.
 
 ## Configuracao
 
 1. Copie `.env.example` para `.env`
 2. Defina uma `API_KEY` forte
-3. (Opcional) Defina `CORS_ORIGIN` com a URL do app frontend
+3. (Opcional) Defina `CORS_ORIGIN` com a URL do frontend
+4. (Opcional) Defina `LOVABLE_EVENTS_URL` e `LOVABLE_WEBHOOK_SECRET` para receber eventos
 
-## Rodando localmente
+## Scripts
+
+```bash
+npm start         # modo oficial (index.js)
+npm run dev       # modo oficial (index.js)
+npm run start:api # modo alternativo - API
+npm run start:worker # modo alternativo - worker
+```
+
+## Rodando localmente (modo oficial)
 
 ```bash
 npm install
@@ -20,16 +41,17 @@ API em `http://localhost:3000`.
 
 ## Autenticacao
 
-Rotas protegidas exigem headers:
+Rotas protegidas exigem header:
 
 `x-api-key: SUA_API_KEY`
 
-## Endpoints
+## Endpoints (modo oficial)
 
 - `GET /health` (sem auth)
-- `GET /start?session=nome_sessao` (com auth + tenant)
+- `GET /start?session=nome_sessao` (com auth)
 - `GET /qr?session=nome_sessao` (com auth)
 - `POST /send` (com auth)
+- `DELETE /session?session=nome_sessao` (com auth)
 
 ### Payload `/send`
 
@@ -44,12 +66,11 @@ Rotas protegidas exigem headers:
 ## Fluxo recomendado
 
 1. Chamar `GET /start?session=<id_cliente>`
-2. Chamar `GET /qr?session=<id_cliente>` e escanear QR
+2. Chamar `GET /qr?session=<id_cliente>` e escanear o QR
 3. Aguardar conexao da sessao
-4. Chamar `POST /send` para envio
+4. Chamar `POST /send` para envio de mensagem
 
-## Escalabilidade
+## Observacao para Render + Lovable
 
-Este modo e indicado para iniciar com baixo custo.
-Quando atingir cerca de 15-20 clientes ativos, a recomendacao e migrar para
-arquitetura desacoplada (API + worker + fila + persistencia externa).
+- Se continuar usando `npm start`, o comportamento atual nao muda.
+- Alteracoes no modo alternativo (`api.js` + `worker.js`) nao afetam o fluxo atual enquanto voce nao trocar o comando de inicializacao/deploy.

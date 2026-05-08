@@ -45,7 +45,7 @@ async function startSession(sessionId, tenantId) {
     const sock = makeWASocket({
         auth: state,
         version,
-        browser: ["Ubuntu", "Chrome", "20.0.04"]
+        browser: ["Windows", "Chrome", "10.0"]
     })
 
     sockets.set(sessionId, sock)

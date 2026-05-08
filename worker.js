@@ -63,6 +63,49 @@ async function resolveJidToPn(sock, jid) {
     return toDigitsPn(j)
 }
 
+function unwrapMessageNode(m, depth = 0) {
+    if (!m || typeof m !== "object" || depth > 10) return m
+    const inner =
+        m.ephemeralMessage?.message ??
+        m.viewOnceMessage?.message ??
+        m.viewOnceMessageV2?.message ??
+        m.viewOnceMessageV2Extension?.message ??
+        m.documentWithCaptionMessage?.message ??
+        m.deviceSentMessage?.message ??
+        m.editedMessage?.message
+    if (inner) return unwrapMessageNode(inner, depth + 1)
+    return m
+}
+
+function extractMessageText(msg) {
+    const m = msg?.message
+    if (!m || typeof m !== "object") return ""
+
+    const inner = unwrapMessageNode(m)
+
+    return (
+        inner.conversation ??
+        inner.extendedTextMessage?.text ??
+        inner.imageMessage?.caption ??
+        inner.videoMessage?.caption ??
+        inner.documentMessage?.caption ??
+        inner.buttonsResponseMessage?.selectedDisplayText ??
+        inner.templateButtonReplyMessage?.selectedDisplayText ??
+        inner.listResponseMessage?.title ??
+        inner.listResponseMessage?.singleSelectReply?.selectedRowId ??
+        inner.reactionMessage?.text ??
+        ""
+    )
+}
+
+function peekSurfaceMessageType(msg) {
+    const keys =
+        msg?.message && typeof msg.message === "object"
+            ? Object.keys(msg.message)
+            : []
+    return keys.length ? keys[0] : null
+}
+
 function buildConnectionWebhookPayload(sessionId, sock, status) {
     const userId = sock.user?.id
     return {
@@ -83,7 +126,8 @@ function buildMessageWebhookPayload(sessionId, sock, params) {
         toDigits,
         text,
         message_id,
-        timestamp
+        timestamp,
+        message_type
     } = params
     return {
         sessionId,
@@ -100,7 +144,8 @@ function buildMessageWebhookPayload(sessionId, sock, params) {
         sockUserId: userId,
         text,
         message_id,
-        timestamp
+        timestamp,
+        message_type: message_type ?? null
     }
 }
 
@@ -204,10 +249,8 @@ async function startSession(sessionId, tenantId) {
         for (const msg of messages || []) {
             if (!msg?.message) continue
 
-            const texto =
-                msg.message.conversation ||
-                msg.message.extendedTextMessage?.text ||
-                "[mensagem nao suportada]"
+            const texto = extractMessageText(msg)
+            const messageType = peekSurfaceMessageType(msg)
 
             const instanceDigits = await resolveJidToPn(sock, sock.user?.id)
             const isGroup = msg.key.remoteJid?.endsWith("@g.us")
@@ -256,7 +299,8 @@ async function startSession(sessionId, tenantId) {
                     toDigits,
                     text: texto,
                     message_id: msg.key.id,
-                    timestamp: msg.messageTimestamp
+                    timestamp: msg.messageTimestamp,
+                    message_type: messageType
                 })
             )
 
@@ -301,7 +345,8 @@ async function sendMessage({ sessionId, tenantId, numero, mensagem }) {
             toDigits,
             text: mensagem,
             message_id: sent?.key?.id ?? null,
-            timestamp: Math.floor(Date.now() / 1000)
+            timestamp: Math.floor(Date.now() / 1000),
+            message_type: "api_text"
         })
     )
 }

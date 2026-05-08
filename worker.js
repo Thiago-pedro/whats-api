@@ -49,6 +49,35 @@ async function resolveJid(sock, jid) {
     return jid.split("@")[0].split(":")[0]
 }
 
+function withLovableConnectionPayload(payload, sessionId, sock) {
+    const pn = sock.user?.id?.split("@")[0]?.split(":")[0]
+    return {
+        ...payload,
+        session: sessionId,
+        sessionId,
+        phone_number: pn,
+        me: pn,
+        sockUserId: sock.user?.id ?? null
+    }
+}
+
+function withLovableMessagePayload(payload, sessionId, sock, instancePn, from, to) {
+    return {
+        ...payload,
+        session: sessionId,
+        sessionId,
+        from,
+        to,
+        senderPn: from,
+        recipientPn: to,
+        fromPn: from,
+        toPn: to,
+        me: instancePn,
+        sockUserId: sock.user?.id ?? null,
+        phone_number: instancePn
+    }
+}
+
 const sockets = new Map()
 
 async function startSession(sessionId, tenantId) {
@@ -102,12 +131,16 @@ async function startSession(sessionId, tenantId) {
                 lastError: null
             })
             await registerEvent(sessionId, tenantId, "connected")
-            postLovableWebhook({
-                event: "connection.update",
-                session: sessionId,
-                status: "connected",
-                phone_number: sock.user?.id?.split("@")[0]?.split(":")[0]
-            })
+            postLovableWebhook(
+                withLovableConnectionPayload(
+                    {
+                        event: "connection.update",
+                        status: "connected"
+                    },
+                    sessionId,
+                    sock
+                )
+            )
             console.log(`✅ Sessao ${sessionId} conectada`)
         }
 
@@ -128,11 +161,16 @@ async function startSession(sessionId, tenantId) {
                 statusCode: statusCode || null,
                 loggedOut
             })
-            postLovableWebhook({
-                event: "connection.update",
-                session: sessionId,
-                status: loggedOut ? "logged_out" : "disconnected"
-            })
+            postLovableWebhook(
+                withLovableConnectionPayload(
+                    {
+                        event: "connection.update",
+                        status: loggedOut ? "logged_out" : "disconnected"
+                    },
+                    sessionId,
+                    sock
+                )
+            )
 
             if (loggedOut) {
                 sockets.delete(sessionId)
@@ -188,17 +226,23 @@ async function startSession(sessionId, tenantId) {
                 })
             }
 
-            postLovableWebhook({
-                event: "messages.upsert",
-                session: sessionId,
-                from,
-                to,
-                fromMe: !!msg.key.fromMe,
-                direction,
-                text: texto,
-                messageId: msg.key.id,
-                timestamp: msg.messageTimestamp
-            })
+            postLovableWebhook(
+                withLovableMessagePayload(
+                    {
+                        event: "messages.upsert",
+                        fromMe: !!msg.key.fromMe,
+                        direction,
+                        text: texto,
+                        messageId: msg.key.id,
+                        timestamp: msg.messageTimestamp
+                    },
+                    sessionId,
+                    sock,
+                    instancePn,
+                    from,
+                    to
+                )
+            )
 
             console.log("📩 Nova mensagem", {
                 sessionId,
@@ -230,16 +274,23 @@ async function sendMessage({ sessionId, tenantId, numero, mensagem }) {
     await registerEvent(sessionId, tenantId, "message_sent", { numero })
     const instancePn = await resolveJid(sock, sock.user?.id)
     const toResolved = await resolveJid(sock, `${numero}@s.whatsapp.net`)
-    postLovableWebhook({
-        event: "messages.upsert",
-        session: sessionId,
-        from: instancePn,
-        to: toResolved || numero,
-        fromMe: true,
-        direction: "out",
-        text: mensagem,
-        timestamp: Math.floor(Date.now() / 1000)
-    })
+    const toVal = toResolved || numero
+    postLovableWebhook(
+        withLovableMessagePayload(
+            {
+                event: "messages.upsert",
+                fromMe: true,
+                direction: "out",
+                text: mensagem,
+                timestamp: Math.floor(Date.now() / 1000)
+            },
+            sessionId,
+            sock,
+            instancePn,
+            instancePn,
+            toVal
+        )
+    )
 }
 
 async function bootstrapWorker() {

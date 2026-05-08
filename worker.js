@@ -77,6 +77,57 @@ function unwrapMessageNode(m, depth = 0) {
     return m
 }
 
+const WEBHOOK_DENY_MESSAGE_KEYS = new Set([
+    "protocolMessage",
+    "reactionMessage",
+    "senderKeyDistributionMessage",
+    "pollUpdateMessage",
+    "keepInChatMessage",
+    "pinInChatMessage",
+    "ephemeralSettingMessage"
+])
+
+const WEBHOOK_ALLOW_MESSAGE_KEYS = new Set([
+    "conversation",
+    "extendedTextMessage",
+    "imageMessage",
+    "videoMessage",
+    "audioMessage",
+    "documentMessage",
+    "documentWithCaptionMessage",
+    "stickerMessage",
+    "contactMessage",
+    "contactsArrayMessage",
+    "locationMessage",
+    "liveLocationMessage",
+    "buttonsResponseMessage",
+    "listResponseMessage",
+    "templateButtonReplyMessage",
+    "interactiveResponseMessage"
+])
+
+function getInnerSubstantiveKeys(inner) {
+    if (!inner || typeof inner !== "object") return []
+    return Object.keys(inner).filter((k) => k !== "messageContextInfo")
+}
+
+function classifyInnerForWebhook(inner) {
+    const keys = getInnerSubstantiveKeys(inner)
+    if (keys.length === 0) return null
+    if (keys.some((k) => WEBHOOK_DENY_MESSAGE_KEYS.has(k))) return null
+    const allowedKey = keys.find((k) => WEBHOOK_ALLOW_MESSAGE_KEYS.has(k))
+    if (!allowedKey) return null
+    return { allowedKey }
+}
+
+function shouldForwardUpsertToChatfy(msg) {
+    if (msg.messageStubType != null) return false
+    if (msg.key?.remoteJid === "status@broadcast") return false
+    if (!msg.message || typeof msg.message !== "object") return false
+    const inner = unwrapMessageNode(msg.message)
+    return classifyInnerForWebhook(inner) != null
+}
+
 function extractMessageText(msg) {
     const m = msg?.message
     if (!m || typeof m !== "object") return ""
@@ -93,17 +144,11 @@ function extractMessageText(msg) {
         inner.templateButtonReplyMessage?.selectedDisplayText ??
         inner.listResponseMessage?.title ??
         inner.listResponseMessage?.singleSelectReply?.selectedRowId ??
-        inner.reactionMessage?.text ??
+        inner.interactiveResponseMessage?.body?.text ??
+        inner.contactMessage?.displayName ??
+        inner.contactsArrayMessage?.contacts?.[0]?.displayName ??
         ""
     )
-}
-
-function peekSurfaceMessageType(msg) {
-    const keys =
-        msg?.message && typeof msg.message === "object"
-            ? Object.keys(msg.message)
-            : []
-    return keys.length ? keys[0] : null
 }
 
 function buildConnectionWebhookPayload(sessionId, sock, status) {
@@ -245,12 +290,37 @@ async function startSession(sessionId, tenantId) {
         }
     })
 
+    sock.ev.on("messages.update", async (updates) => {
+        const userId = sock.user?.id
+        for (const u of updates || []) {
+            if (!u?.key) continue
+            const st = u.update?.status
+            if (st == null) continue
+
+            postLovableWebhook({
+                sessionId,
+                type: "message.status",
+                me: userId,
+                sockUserId: userId,
+                phone_number: userId?.split("@")[0]?.split(":")[0],
+                message_id: u.key.id,
+                remoteJid: u.key.remoteJid,
+                fromMe: !!u.key.fromMe,
+                status: st,
+                timestamp: u.update?.messageTimestamp
+            })
+        }
+    })
+
     sock.ev.on("messages.upsert", async ({ messages }) => {
         for (const msg of messages || []) {
             if (!msg?.message) continue
+            if (!shouldForwardUpsertToChatfy(msg)) continue
 
             const texto = extractMessageText(msg)
-            const messageType = peekSurfaceMessageType(msg)
+            const inner = unwrapMessageNode(msg.message)
+            const classified = classifyInnerForWebhook(inner)
+            const messageType = classified?.allowedKey ?? null
 
             const instanceDigits = await resolveJidToPn(sock, sock.user?.id)
             const isGroup = msg.key.remoteJid?.endsWith("@g.us")

@@ -88,10 +88,14 @@ async function startSession(sessionId, tenantId) {
                 lastError: null
             })
             await registerEvent(sessionId, tenantId, "connected")
+            const rawId = sock.user?.id ?? ""
+            const phoneNumber =
+                rawId.split("@")[0].split(":")[0].replace(/\D/g, "") || null
             postLovableWebhook({
                 event: "connection.update",
                 session: sessionId,
-                status: "connected"
+                status: "connected",
+                phone_number: phoneNumber
             })
             console.log(`✅ Sessao ${sessionId} conectada`)
         }

@@ -12,6 +12,29 @@ const { connection } = require("./lib/redis")
 const { updateSession, getSession, registerEvent } = require("./lib/sessionStore")
 const { initDb } = require("./lib/db")
 
+async function postLovableWebhook(payload) {
+    const url = process.env.LOVABLE_EVENTS_URL
+    if (!url) return
+
+    try {
+        const headers = {
+            "Content-Type": "application/json"
+        }
+
+        if (process.env.LOVABLE_WEBHOOK_SECRET) {
+            headers["x-webhook-secret"] = process.env.LOVABLE_WEBHOOK_SECRET
+        }
+
+        await fetch(url, {
+            method: "POST",
+            headers,
+            body: JSON.stringify(payload)
+        })
+    } catch (error) {
+        console.log("⚠️ LOVABLE webhook falhou:", error?.message || error)
+    }
+}
+
 const sockets = new Map()
 
 async function startSession(sessionId, tenantId) {
@@ -65,6 +88,11 @@ async function startSession(sessionId, tenantId) {
                 lastError: null
             })
             await registerEvent(sessionId, tenantId, "connected")
+            postLovableWebhook({
+                event: "connection.update",
+                session: sessionId,
+                status: "connected"
+            })
             console.log(`✅ Sessao ${sessionId} conectada`)
         }
 
@@ -85,6 +113,11 @@ async function startSession(sessionId, tenantId) {
                 statusCode: statusCode || null,
                 loggedOut
             })
+            postLovableWebhook({
+                event: "connection.update",
+                session: sessionId,
+                status: loggedOut ? "logged_out" : "disconnected"
+            })
 
             if (loggedOut) {
                 sockets.delete(sessionId)
@@ -101,20 +134,35 @@ async function startSession(sessionId, tenantId) {
     })
 
     sock.ev.on("messages.upsert", async ({ messages }) => {
-        const msg = messages[0]
-        if (!msg?.message || msg.key.fromMe) return
+        for (const msg of messages || []) {
+            if (!msg?.message) continue
 
-        let numero = msg.key.remoteJid || ""
-        if (numero.includes("@s.whatsapp.net")) numero = numero.replace("@s.whatsapp.net", "")
-        if (numero.includes("@lid")) numero = "Numero oculto (LID)"
+            let numero = msg.key.remoteJid || ""
+            if (numero.includes("@s.whatsapp.net")) numero = numero.replace("@s.whatsapp.net", "")
+            if (numero.includes("@lid")) numero = "Numero oculto (LID)"
 
-        const texto =
-            msg.message.conversation ||
-            msg.message.extendedTextMessage?.text ||
-            "[mensagem nao suportada]"
+            const texto =
+                msg.message.conversation ||
+                msg.message.extendedTextMessage?.text ||
+                "[mensagem nao suportada]"
 
-        await registerEvent(sessionId, tenantId, "incoming_message", { numero, texto })
-        console.log("📩 Nova mensagem", { sessionId, numero, texto })
+            if (!msg.key.fromMe) {
+                await registerEvent(sessionId, tenantId, "incoming_message", { numero, texto })
+            }
+
+            postLovableWebhook({
+                event: "messages.upsert",
+                session: sessionId,
+                from: msg.key.fromMe ? undefined : numero,
+                to: msg.key.fromMe ? numero : undefined,
+                fromMe: !!msg.key.fromMe,
+                text: texto,
+                messageId: msg.key.id,
+                timestamp: msg.messageTimestamp
+            })
+
+            console.log("📩 Nova mensagem", { sessionId, numero, fromMe: !!msg.key.fromMe, texto })
+        }
     })
 }
 
@@ -135,6 +183,14 @@ async function sendMessage({ sessionId, tenantId, numero, mensagem }) {
 
     await sock.sendMessage(`${numero}@s.whatsapp.net`, { text: mensagem })
     await registerEvent(sessionId, tenantId, "message_sent", { numero })
+    postLovableWebhook({
+        event: "messages.upsert",
+        session: sessionId,
+        to: numero,
+        fromMe: true,
+        text: mensagem,
+        timestamp: Math.floor(Date.now() / 1000)
+    })
 }
 
 async function bootstrapWorker() {

@@ -359,8 +359,9 @@ async function startSession(sessionId) {
                     }
                     setTimeout(() => startSession(sessionId), 2000)
                 } else {
-                    console.log("🚫 Sessão deslogada, precisa escanear QR novamente")
+                    console.log("🚫 Sessão deslogada — removendo credenciais salvas para permitir novo QR")
                     qrWaiters.delete(sessionId)
+                    clearAuthState(sessionId)
                     delete sessions[sessionId]
                 }
             }
@@ -457,6 +458,8 @@ app.delete("/session", (req, res) => {
     if (!removed) {
         return sendError(res, 404, "sessao nao encontrada")
     }
+
+    clearAuthState(sessionId)
 
     return sendSuccess(res, 200, {
         message: "sessao removida",

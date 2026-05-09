@@ -273,6 +273,12 @@ async function startSession(sessionId) {
                     sessions[sessionId].qrUpdatedAt = new Date().toISOString()
                 }
                 const qrDataUrl = sessions[sessionId]?.qrCode
+                postLovableWebhook({
+                    event: "qr",
+                    sessionId,
+                    qr: qrDataUrl,
+                    updatedAt: sessions[sessionId]?.qrUpdatedAt ?? null
+                })
                 notifyQrWaiters(sessionId, { kind: "qr" })
                 sseBroadcast(sessionId, "qr", { qr: qrDataUrl })
                 console.log(`\n📲 QR da sessão ${sessionId}:`)
@@ -497,7 +503,8 @@ app.get("/qr", async (req, res) => {
     const waitSec = waitParam !== undefined ? Number(waitParam) : NaN
     const useLongPoll = Number.isFinite(waitSec) && waitSec > 0
     const waitMs = Math.min(Math.max(waitSec * 1000, 0), 120000)
-    const wantsHtml = !useLongPoll && req.query.format !== "json"
+    // Sem format=html, responder JSON (SPA). Aceitar só HTML no browser com ?format=html.
+    const wantsHtml = !useLongPoll && req.query.format === "html"
 
     if (!isValidSessionId(sessionId)) {
         return sendError(res, 400, "session invalida")

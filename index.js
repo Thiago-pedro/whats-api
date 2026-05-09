@@ -80,6 +80,41 @@ function getMessagePreviewText(msg) {
     }
 }
 
+function logLastDisconnect(sessionId, lastDisconnect) {
+    if (!lastDisconnect) {
+        console.log(`🔌 lastDisconnect [${sessionId}]: (sem detalhes)`)
+        return
+    }
+    const err = lastDisconnect.error
+    const statusCode =
+        err?.output?.statusCode ??
+        err?.statusCode ??
+        (typeof err?.code === "number" ? err.code : null)
+    let reason = ""
+    if (typeof err?.message === "string" && err.message) {
+        reason = err.message
+    } else if (err && typeof err.toString === "function") {
+        reason = err.toString()
+    }
+    const maxLen = 400
+    if (reason.length > maxLen) {
+        reason = reason.slice(0, maxLen) + "…"
+    }
+    const when = lastDisconnect.date
+        ? new Date(lastDisconnect.date).toISOString()
+        : null
+    const name = typeof err?.name === "string" ? err.name : null
+    console.log(
+        `🔌 lastDisconnect [${sessionId}]`,
+        JSON.stringify({
+            statusCode: statusCode ?? null,
+            name,
+            reason: reason || null,
+            at: when
+        })
+    )
+}
+
 async function postLovableWebhook(payload) {
     const url = process.env.LOVABLE_EVENTS_URL
     if (!url || typeof url !== "string") return
@@ -300,6 +335,7 @@ async function startSession(sessionId) {
 
             if (connection === "close") {
                 console.log(`❌ Sessão ${sessionId} desconectada`)
+                logLastDisconnect(sessionId, lastDisconnect)
                 if (sessions[sessionId]) {
                     sessions[sessionId].connected = false
                     sessions[sessionId].qrCode = null

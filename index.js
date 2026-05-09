@@ -15,9 +15,18 @@ const qrcode = require("qrcode-terminal")
 const QRCode = require("qrcode")
 
 const app = express()
+
 const PORT = Number(process.env.PORT) || 3000
 const API_KEY = process.env.API_KEY
 const CORS_ORIGIN = process.env.CORS_ORIGIN || "*"
+
+const rawAuthRoot = typeof process.env.WHATSAPP_AUTH_ROOT === "string" ? process.env.WHATSAPP_AUTH_ROOT.trim() : ""
+/** Produção Render: igual ao Mount Path do Persistent Disk ou env WHATSAPP_AUTH_ROOT */
+const AUTH_ROOT = path.resolve(rawAuthRoot || path.join(__dirname, "auth"))
+
+function authStateDir(sessionId) {
+    return path.join(AUTH_ROOT, sessionId)
+}
 
 app.use(express.json())
 app.use(cors({ origin: CORS_ORIGIN === "*" ? true : CORS_ORIGIN }))
@@ -159,7 +168,7 @@ function createSessionRecord() {
 }
 
 function clearAuthState(sessionId) {
-    const dir = path.join(__dirname, "auth", sessionId)
+    const dir = authStateDir(sessionId)
     try {
         if (fs.existsSync(dir)) {
             fs.rmSync(dir, { recursive: true, force: true })
@@ -225,7 +234,7 @@ function sseBroadcast(sessionId, type, data) {
 
 async function startSession(sessionId) {
     try {
-        const { state, saveCreds } = await useMultiFileAuthState(`auth/${sessionId}`)
+        const { state, saveCreds } = await useMultiFileAuthState(authStateDir(sessionId))
         const version = await getBaileysVersionCached()
 
         const sock = makeWASocket({
@@ -706,5 +715,11 @@ app.get("/health", (req, res) => {
 })
 
 app.listen(PORT, () => {
+    try {
+        fs.mkdirSync(AUTH_ROOT, { recursive: true })
+    } catch (error) {
+        console.log("⚠️ Não consegui garantir pasta AUTH_ROOT:", error?.message || error)
+    }
+    console.log(`📁 Auth Baileys (persistente): ${AUTH_ROOT}`)
     console.log(`🚀 API rodando em http://localhost:${PORT}`)
 })

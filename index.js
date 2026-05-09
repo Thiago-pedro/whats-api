@@ -1,6 +1,8 @@
 const express = require("express")
 const cors = require("cors")
 const axios = require("axios")
+const fs = require("fs")
+const path = require("path")
 require("dotenv").config()
 const {
     default: makeWASocket,
@@ -93,9 +95,44 @@ async function postLovableWebhook(payload) {
     }
 }
 
-app.use(["/start", "/send", "/qr", "/session"], authMiddleware)
+app.use(["/start", "/send", "/qr", "/session", "/warmup", "/health", "/events"], authMiddleware)
 
 const sessions = {}
+/** @type {Map<string, Array<{ resolve: Function, timer: NodeJS.Timeout }>>} */
+const qrWaiters = new Map()
+/** @type {Map<string, Set<import('http').ServerResponse>>} */
+const sseClients = new Map()
+
+let baileysVersionPromise = null
+function getBaileysVersionCached() {
+    if (!baileysVersionPromise) {
+        baileysVersionPromise = fetchLatestBaileysVersion().then((r) => r.version)
+    }
+    return baileysVersionPromise
+}
+
+function createSessionRecord() {
+    return {
+        sock: null,
+        connected: false,
+        starting: true,
+        qrCode: null,
+        qrUpdatedAt: null,
+        connectionState: "connecting",
+        startedAt: new Date().toISOString()
+    }
+}
+
+function clearAuthState(sessionId) {
+    const dir = path.join(__dirname, "auth", sessionId)
+    try {
+        if (fs.existsSync(dir)) {
+            fs.rmSync(dir, { recursive: true, force: true })
+        }
+    } catch (error) {
+        console.log("⚠️ Falha ao limpar auth state:", error?.message || error)
+    }
+}
 
 function closeSocketSafely(sock) {
     if (!sock) return
@@ -119,10 +156,42 @@ function resetSession(sessionId) {
     return true
 }
 
+function isSessionBusy(sessionId) {
+    const s = sessions[sessionId]
+    if (!s) return false
+    if (s.starting) return true
+    if (s.sock) return true
+    return false
+}
+
+function notifyQrWaiters(sessionId, payload) {
+    const list = qrWaiters.get(sessionId)
+    if (!list?.length) return
+    qrWaiters.delete(sessionId)
+    for (const { resolve, timer } of list) {
+        clearTimeout(timer)
+        resolve(payload)
+    }
+}
+
+function sseBroadcast(sessionId, type, data) {
+    const clients = sseClients.get(sessionId)
+    if (!clients?.size) return
+    const payload = JSON.stringify({ type, data })
+    const chunk = `event: ${type}\ndata: ${payload}\n\n`
+    for (const res of clients) {
+        try {
+            res.write(chunk)
+        } catch {
+            clients.delete(res)
+        }
+    }
+}
+
 async function startSession(sessionId) {
     try {
         const { state, saveCreds } = await useMultiFileAuthState(`auth/${sessionId}`)
-        const { version } = await fetchLatestBaileysVersion()
+        const version = await getBaileysVersionCached()
 
         const sock = makeWASocket({
             auth: state,
@@ -131,17 +200,16 @@ async function startSession(sessionId) {
         })
 
         if (!sessions[sessionId]) {
-            sessions[sessionId] = {
-                sock: null,
-                connected: false,
-                starting: true,
-                qrCode: null,
-                qrUpdatedAt: null
-            }
+            sessions[sessionId] = createSessionRecord()
         }
 
-        sessions[sessionId].sock = sock
-        sessions[sessionId].connected = false
+        const rec = sessions[sessionId]
+        rec.sock = sock
+        rec.connected = false
+        rec.connectionState = "connecting"
+        if (!rec.startedAt) {
+            rec.startedAt = new Date().toISOString()
+        }
 
         sock.ev.on("creds.update", saveCreds)
 
@@ -184,6 +252,10 @@ async function startSession(sessionId) {
         sock.ev.on("connection.update", async (update) => {
             const { connection, qr, lastDisconnect } = update
 
+            if (connection !== undefined && sessions[sessionId]) {
+                sessions[sessionId].connectionState = connection
+            }
+
             if (connection !== undefined || lastDisconnect !== undefined) {
                 postLovableWebhook({
                     event: "connection.update",
@@ -200,6 +272,9 @@ async function startSession(sessionId) {
                     sessions[sessionId].qrCode = await QRCode.toDataURL(qr)
                     sessions[sessionId].qrUpdatedAt = new Date().toISOString()
                 }
+                const qrDataUrl = sessions[sessionId]?.qrCode
+                notifyQrWaiters(sessionId, { kind: "qr" })
+                sseBroadcast(sessionId, "qr", { qr: qrDataUrl })
                 console.log(`\n📲 QR da sessão ${sessionId}:`)
                 qrcode.generate(qr, { small: true })
             }
@@ -210,7 +285,10 @@ async function startSession(sessionId) {
                     sessions[sessionId].starting = false
                     sessions[sessionId].qrCode = null
                     sessions[sessionId].qrUpdatedAt = null
+                    sessions[sessionId].connectionState = "open"
                 }
+                notifyQrWaiters(sessionId, { kind: "connected" })
+                sseBroadcast(sessionId, "connected", {})
                 console.log(`✅ Sessão ${sessionId} conectada`)
             }
 
@@ -220,9 +298,13 @@ async function startSession(sessionId) {
                     sessions[sessionId].connected = false
                     sessions[sessionId].qrCode = null
                     sessions[sessionId].qrUpdatedAt = null
+                    sessions[sessionId].connectionState = "close"
                 }
 
                 const statusCode = lastDisconnect?.error?.output?.statusCode
+                sseBroadcast(sessionId, "disconnected", {
+                    statusCode: statusCode ?? null
+                })
 
                 if (statusCode !== 401) {
                     if (sessions[sessionId]?.sock !== sock) {
@@ -231,21 +313,24 @@ async function startSession(sessionId) {
                     console.log("🔄 Tentando reconectar...")
                     if (sessions[sessionId]) {
                         sessions[sessionId].starting = true
+                        sessions[sessionId].connectionState = "connecting"
                     }
                     setTimeout(() => startSession(sessionId), 2000)
                 } else {
                     console.log("🚫 Sessão deslogada, precisa escanear QR novamente")
+                    qrWaiters.delete(sessionId)
                     delete sessions[sessionId]
                 }
             }
         })
     } catch (error) {
         console.log(`❌ Falha ao iniciar sessão ${sessionId}:`, error?.message || error)
+        qrWaiters.delete(sessionId)
         delete sessions[sessionId]
     }
 }
 
-app.get("/start", async (req, res) => {
+function handleStart(req, res) {
     const sessionId = req.query.session?.toString()
     const forceStart = req.query.force?.toString() === "1"
 
@@ -253,33 +338,67 @@ app.get("/start", async (req, res) => {
         return sendError(res, 400, "session invalida. use 3-60 caracteres: letras, numeros, _ ou -")
     }
 
-    if (sessions[sessionId]) {
-        if (!forceStart) {
-            return sendSuccess(res, 200, { message: "sessao ja iniciada", session: sessionId })
-        }
+    if (forceStart) {
         console.log(`🔁 Reinicio forcado da sessao ${sessionId}`)
         resetSession(sessionId)
+        clearAuthState(sessionId)
+    } else if (isSessionBusy(sessionId)) {
+        return res.status(200).json({
+            ok: true,
+            message: "already running",
+            session: sessionId
+        })
+    } else if (sessions[sessionId]) {
+        delete sessions[sessionId]
     }
 
-    sessions[sessionId] = {
-        sock: null,
-        connected: false,
-        starting: true,
-        qrCode: null,
-        qrUpdatedAt: null
-    }
+    sessions[sessionId] = createSessionRecord()
 
     startSession(sessionId)
 
     if (forceStart) {
-        return sendSuccess(res, 202, {
+        return res.status(202).json({
+            ok: true,
             message: "sessao reiniciada",
             session: sessionId
         })
     }
 
-    return sendSuccess(res, 202, {
+    return res.status(202).json({
+        ok: true,
         message: "sessao iniciada",
+        session: sessionId
+    })
+}
+
+app.get("/start", handleStart)
+app.post("/start", handleStart)
+
+app.post("/warmup", (req, res) => {
+    const sessionId = req.query.session?.toString()
+
+    if (!isValidSessionId(sessionId)) {
+        return sendError(res, 400, "session invalida. use 3-60 caracteres: letras, numeros, _ ou -")
+    }
+
+    if (isSessionBusy(sessionId)) {
+        return res.status(200).json({
+            ok: true,
+            alreadyRunning: true,
+            session: sessionId
+        })
+    }
+
+    if (sessions[sessionId]) {
+        delete sessions[sessionId]
+    }
+
+    sessions[sessionId] = createSessionRecord()
+    setImmediate(() => startSession(sessionId))
+
+    return res.status(202).json({
+        ok: true,
+        warming: true,
         session: sessionId
     })
 })
@@ -291,6 +410,7 @@ app.delete("/session", (req, res) => {
         return sendError(res, 400, "session invalida")
     }
 
+    qrWaiters.delete(sessionId)
     const removed = resetSession(sessionId)
     if (!removed) {
         return sendError(res, 404, "sessao nao encontrada")
@@ -349,8 +469,35 @@ app.post("/send", async (req, res) => {
     }
 })
 
-app.get("/qr", (req, res) => {
+function removeQrWaiter(sessionId, entry) {
+    const list = qrWaiters.get(sessionId)
+    if (!list) return
+    const idx = list.indexOf(entry)
+    if (idx >= 0) list.splice(idx, 1)
+    if (!list.length) qrWaiters.delete(sessionId)
+}
+
+function subscribeQrWait(sessionId, timeoutMs) {
+    return new Promise((resolve) => {
+        const entry = { resolve, timer: null }
+        entry.timer = setTimeout(() => {
+            removeQrWaiter(sessionId, entry)
+            resolve({ kind: "timeout" })
+        }, timeoutMs)
+        if (!qrWaiters.has(sessionId)) {
+            qrWaiters.set(sessionId, [])
+        }
+        qrWaiters.get(sessionId).push(entry)
+    })
+}
+
+app.get("/qr", async (req, res) => {
     const sessionId = req.query.session?.toString()
+    const waitParam = req.query.wait
+    const waitSec = waitParam !== undefined ? Number(waitParam) : NaN
+    const useLongPoll = Number.isFinite(waitSec) && waitSec > 0
+    const waitMs = Math.min(Math.max(waitSec * 1000, 0), 120000)
+    const wantsHtml = !useLongPoll && req.query.format !== "json"
 
     if (!isValidSessionId(sessionId)) {
         return sendError(res, 400, "session invalida")
@@ -362,6 +509,16 @@ app.get("/qr", (req, res) => {
     }
 
     if (sessionData.connected) {
+        if (useLongPoll) {
+            return res.status(200).json({
+                ok: true,
+                data: {
+                    connected: true,
+                    session: sessionId,
+                    message: "sessao conectada, nao precisa de qr"
+                }
+            })
+        }
         return sendSuccess(res, 200, {
             session: sessionId,
             connected: true,
@@ -369,11 +526,44 @@ app.get("/qr", (req, res) => {
         })
     }
 
+    if (useLongPoll) {
+        if (sessionData.qrCode) {
+            return res.status(200).json({
+                ok: true,
+                data: { qr: sessionData.qrCode }
+            })
+        }
+
+        const result = await subscribeQrWait(sessionId, waitMs)
+        const fresh = sessions[sessionId]
+
+        if (fresh?.connected || result.kind === "connected") {
+            return res.status(200).json({
+                ok: true,
+                data: {
+                    connected: true,
+                    session: sessionId,
+                    message: "sessao conectada, nao precisa de qr"
+                }
+            })
+        }
+
+        if (fresh?.qrCode || result.kind === "qr") {
+            return res.status(200).json({
+                ok: true,
+                data: { qr: fresh?.qrCode }
+            })
+        }
+
+        return sendError(res, 404, "qr indisponivel")
+    }
+
     if (!sessionData.qrCode) {
         return sendError(res, 404, "qr indisponivel no momento, tente novamente em alguns segundos")
     }
 
-    return res.status(200).send(`<!doctype html>
+    if (wantsHtml) {
+        return res.status(200).send(`<!doctype html>
 <html lang="pt-BR">
 <head>
   <meta charset="utf-8" />
@@ -395,6 +585,70 @@ app.get("/qr", (req, res) => {
   </div>
 </body>
 </html>`)
+    }
+
+    return res.status(200).json({
+        ok: true,
+        data: { qr: sessionData.qrCode }
+    })
+})
+
+app.get("/events", (req, res) => {
+    const sessionId = req.query.session?.toString()
+
+    if (!isValidSessionId(sessionId)) {
+        return sendError(res, 400, "session invalida")
+    }
+
+    const sessionData = sessions[sessionId]
+    if (!sessionData) {
+        return sendError(res, 404, "sessao nao encontrada")
+    }
+
+    res.setHeader("Content-Type", "text/event-stream; charset=utf-8")
+    res.setHeader("Cache-Control", "no-cache, no-transform")
+    res.setHeader("Connection", "keep-alive")
+    res.setHeader("X-Accel-Buffering", "no")
+    if (typeof res.flushHeaders === "function") {
+        res.flushHeaders()
+    }
+
+    if (!sseClients.has(sessionId)) {
+        sseClients.set(sessionId, new Set())
+    }
+    sseClients.get(sessionId).add(res)
+
+    const hello = JSON.stringify({
+        type: "hello",
+        data: {
+            session: sessionId,
+            connected: !!sessionData.connected,
+            hasQr: !!sessionData.qrCode
+        }
+    })
+    res.write(`event: hello\ndata: ${hello}\n\n`)
+
+    if (sessionData.qrCode && !sessionData.connected) {
+        const payload = JSON.stringify({ type: "qr", data: { qr: sessionData.qrCode } })
+        res.write(`event: qr\ndata: ${payload}\n\n`)
+    }
+    if (sessionData.connected) {
+        const payload = JSON.stringify({ type: "connected", data: {} })
+        res.write(`event: connected\ndata: ${payload}\n\n`)
+    }
+
+    const ping = setInterval(() => {
+        try {
+            res.write(`: ping\n\n`)
+        } catch {
+            clearInterval(ping)
+        }
+    }, 25000)
+
+    req.on("close", () => {
+        clearInterval(ping)
+        sseClients.get(sessionId)?.delete(res)
+    })
 })
 
 app.get("/health", (req, res) => {

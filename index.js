@@ -19,6 +19,9 @@ const app = express()
 const PORT = Number(process.env.PORT) || 3000
 const API_KEY = process.env.API_KEY
 const CORS_ORIGIN = process.env.CORS_ORIGIN || "*"
+const ALWAYS_REQUIRE_QR =
+    typeof process.env.ALWAYS_REQUIRE_QR === "string" &&
+    ["1", "true", "yes", "on"].includes(process.env.ALWAYS_REQUIRE_QR.trim().toLowerCase())
 
 const rawAuthRoot = typeof process.env.WHATSAPP_AUTH_ROOT === "string" ? process.env.WHATSAPP_AUTH_ROOT.trim() : ""
 /** Produção Render: igual ao Mount Path do Persistent Disk ou env WHATSAPP_AUTH_ROOT */
@@ -385,13 +388,18 @@ async function startSession(sessionId) {
 function handleStart(req, res) {
     const sessionId = req.query.session?.toString()
     const forceStart = req.query.force?.toString() === "1"
+    const shouldForceRestart = forceStart || ALWAYS_REQUIRE_QR
 
     if (!isValidSessionId(sessionId)) {
         return sendError(res, 400, "session invalida. use 3-60 caracteres: letras, numeros, _ ou -")
     }
 
-    if (forceStart) {
-        console.log(`🔁 Reinicio forcado da sessao ${sessionId}`)
+    if (shouldForceRestart) {
+        if (ALWAYS_REQUIRE_QR && !forceStart) {
+            console.log(`🔒 ALWAYS_REQUIRE_QR ativo: forçando novo QR para sessao ${sessionId}`)
+        } else {
+            console.log(`🔁 Reinicio forcado da sessao ${sessionId}`)
+        }
         resetSession(sessionId)
         clearAuthState(sessionId)
     } else if (isSessionBusy(sessionId)) {
@@ -408,7 +416,7 @@ function handleStart(req, res) {
 
     startSession(sessionId)
 
-    if (forceStart) {
+    if (shouldForceRestart) {
         return res.status(202).json({
             ok: true,
             message: "sessao reiniciada",

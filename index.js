@@ -29,6 +29,11 @@ const RECONNECT_COOLDOWN_MS = Number(process.env.RECONNECT_COOLDOWN_MS)
 const reconnectBackoffBaseMs = Number.isFinite(RECONNECT_BACKOFF_BASE_MS) ? RECONNECT_BACKOFF_BASE_MS : 2000
 const reconnectBackoffMaxMs = Number.isFinite(RECONNECT_BACKOFF_MAX_MS) ? RECONNECT_BACKOFF_MAX_MS : 60000
 const reconnectCooldownMs = Number.isFinite(RECONNECT_COOLDOWN_MS) ? RECONNECT_COOLDOWN_MS : 3000
+const RECONNECT_RESTART_REQUIRED_MS_RAW = Number(process.env.RECONNECT_RESTART_REQUIRED_MS)
+const reconnectRestartRequiredMs =
+    Number.isFinite(RECONNECT_RESTART_REQUIRED_MS_RAW) && RECONNECT_RESTART_REQUIRED_MS_RAW >= 0
+        ? RECONNECT_RESTART_REQUIRED_MS_RAW
+        : 1200
 
 const rawAuthRoot = typeof process.env.WHATSAPP_AUTH_ROOT === "string" ? process.env.WHATSAPP_AUTH_ROOT.trim() : ""
 /** Produção Render: igual ao Mount Path do Persistent Disk ou env WHATSAPP_AUTH_ROOT */
@@ -228,20 +233,31 @@ function scheduleReconnect(sessionId, sock, statusCode) {
         rec.reconnectTimerId = null
     }
 
-    rec.reconnectAttempt = (rec.reconnectAttempt || 0) + 1
-    const attempt = rec.reconnectAttempt
-    const exponential = reconnectBackoffBaseMs * 2 ** Math.min(Math.max(attempt - 1, 0), 12)
-    let delayMs = Math.min(reconnectBackoffMaxMs, exponential)
-    if (reconnectCooldownMs > 0) {
-        delayMs = Math.max(delayMs, reconnectCooldownMs)
+    /** 515 = restart required (comum logo após escanear QR; backoff grande deixa o celular "conectando" à toa) */
+    const isRestartRequired = statusCode === 515
+
+    let delayMs
+
+    if (isRestartRequired) {
+        delayMs = reconnectRestartRequiredMs
+        console.log(
+            `🔄 Reinício rápido (${delayMs}ms) — código 515 após pareamento/restart WA (não sobe tentativa de backoff)`
+        )
+    } else {
+        rec.reconnectAttempt = (rec.reconnectAttempt || 0) + 1
+        const attempt = rec.reconnectAttempt
+        const exponential = reconnectBackoffBaseMs * 2 ** Math.min(Math.max(attempt - 1, 0), 12)
+        delayMs = Math.min(reconnectBackoffMaxMs, exponential)
+        if (reconnectCooldownMs > 0) {
+            delayMs = Math.max(delayMs, reconnectCooldownMs)
+        }
+        console.log(
+            `🔄 Reconexão agendada em ${delayMs}ms (tentativa ${attempt}, code ${statusCode ?? "n/a"})`
+        )
     }
 
     rec.starting = true
     rec.connectionState = "connecting"
-
-    console.log(
-        `🔄 Reconexão agendada em ${delayMs}ms (tentativa ${attempt}, code ${statusCode ?? "n/a"})`
-    )
 
     rec.reconnectTimerId = setTimeout(() => {
         const s = sessions[sessionId]

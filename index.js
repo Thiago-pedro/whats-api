@@ -23,6 +23,13 @@ const ALWAYS_REQUIRE_QR =
     typeof process.env.ALWAYS_REQUIRE_QR === "string" &&
     ["1", "true", "yes", "on"].includes(process.env.ALWAYS_REQUIRE_QR.trim().toLowerCase())
 
+const RECONNECT_BACKOFF_BASE_MS = Number(process.env.RECONNECT_BACKOFF_BASE_MS)
+const RECONNECT_BACKOFF_MAX_MS = Number(process.env.RECONNECT_BACKOFF_MAX_MS)
+const RECONNECT_COOLDOWN_MS = Number(process.env.RECONNECT_COOLDOWN_MS)
+const reconnectBackoffBaseMs = Number.isFinite(RECONNECT_BACKOFF_BASE_MS) ? RECONNECT_BACKOFF_BASE_MS : 2000
+const reconnectBackoffMaxMs = Number.isFinite(RECONNECT_BACKOFF_MAX_MS) ? RECONNECT_BACKOFF_MAX_MS : 60000
+const reconnectCooldownMs = Number.isFinite(RECONNECT_COOLDOWN_MS) ? RECONNECT_COOLDOWN_MS : 3000
+
 const rawAuthRoot = typeof process.env.WHATSAPP_AUTH_ROOT === "string" ? process.env.WHATSAPP_AUTH_ROOT.trim() : ""
 /** Produção Render: igual ao Mount Path do Persistent Disk ou env WHATSAPP_AUTH_ROOT */
 const AUTH_ROOT = path.resolve(rawAuthRoot || path.join(__dirname, "auth"))
@@ -166,7 +173,9 @@ function createSessionRecord() {
         qrCode: null,
         qrUpdatedAt: null,
         connectionState: "connecting",
-        startedAt: new Date().toISOString()
+        startedAt: new Date().toISOString(),
+        reconnectAttempt: 0,
+        reconnectTimerId: null
     }
 }
 
@@ -198,9 +207,50 @@ function closeSocketSafely(sock) {
 function resetSession(sessionId) {
     const existing = sessions[sessionId]
     if (!existing) return false
+    if (existing.reconnectTimerId) {
+        clearTimeout(existing.reconnectTimerId)
+        existing.reconnectTimerId = null
+    }
     closeSocketSafely(existing.sock)
     delete sessions[sessionId]
     return true
+}
+
+function scheduleReconnect(sessionId, sock, statusCode) {
+    if (sessions[sessionId]?.sock !== sock) {
+        return
+    }
+    const rec = sessions[sessionId]
+    if (!rec) return
+
+    if (rec.reconnectTimerId) {
+        clearTimeout(rec.reconnectTimerId)
+        rec.reconnectTimerId = null
+    }
+
+    rec.reconnectAttempt = (rec.reconnectAttempt || 0) + 1
+    const attempt = rec.reconnectAttempt
+    const exponential = reconnectBackoffBaseMs * 2 ** Math.min(Math.max(attempt - 1, 0), 12)
+    let delayMs = Math.min(reconnectBackoffMaxMs, exponential)
+    if (reconnectCooldownMs > 0) {
+        delayMs = Math.max(delayMs, reconnectCooldownMs)
+    }
+
+    rec.starting = true
+    rec.connectionState = "connecting"
+
+    console.log(
+        `🔄 Reconexão agendada em ${delayMs}ms (tentativa ${attempt}, code ${statusCode ?? "n/a"})`
+    )
+
+    rec.reconnectTimerId = setTimeout(() => {
+        const s = sessions[sessionId]
+        if (!s || s.sock !== sock) {
+            return
+        }
+        s.reconnectTimerId = null
+        startSession(sessionId)
+    }, delayMs)
 }
 
 function isSessionBusy(sessionId) {
@@ -334,6 +384,11 @@ async function startSession(sessionId) {
 
             if (connection === "open") {
                 if (sessions[sessionId]) {
+                    if (sessions[sessionId].reconnectTimerId) {
+                        clearTimeout(sessions[sessionId].reconnectTimerId)
+                        sessions[sessionId].reconnectTimerId = null
+                    }
+                    sessions[sessionId].reconnectAttempt = 0
                     sessions[sessionId].connected = true
                     sessions[sessionId].starting = false
                     sessions[sessionId].qrCode = null
@@ -364,15 +419,14 @@ async function startSession(sessionId) {
                     if (sessions[sessionId]?.sock !== sock) {
                         return
                     }
-                    console.log("🔄 Tentando reconectar...")
-                    if (sessions[sessionId]) {
-                        sessions[sessionId].starting = true
-                        sessions[sessionId].connectionState = "connecting"
-                    }
-                    setTimeout(() => startSession(sessionId), 2000)
+                    scheduleReconnect(sessionId, sock, statusCode)
                 } else {
                     console.log("🚫 Sessão deslogada — removendo credenciais salvas para permitir novo QR")
                     qrWaiters.delete(sessionId)
+                    if (sessions[sessionId]?.reconnectTimerId) {
+                        clearTimeout(sessions[sessionId].reconnectTimerId)
+                        sessions[sessionId].reconnectTimerId = null
+                    }
                     clearAuthState(sessionId)
                     delete sessions[sessionId]
                 }
@@ -381,6 +435,10 @@ async function startSession(sessionId) {
     } catch (error) {
         console.log(`❌ Falha ao iniciar sessão ${sessionId}:`, error?.message || error)
         qrWaiters.delete(sessionId)
+        if (sessions[sessionId]?.reconnectTimerId) {
+            clearTimeout(sessions[sessionId].reconnectTimerId)
+            sessions[sessionId].reconnectTimerId = null
+        }
         delete sessions[sessionId]
     }
 }

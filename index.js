@@ -35,6 +35,30 @@ const reconnectRestartRequiredMs =
         ? RECONNECT_RESTART_REQUIRED_MS_RAW
         : 1200
 
+/** Só encaminhar webhook de mensagens “notify” (reduz rajada de sync/histórico; pode omitir alguns eventos) */
+const WEBHOOK_UPSERT_ONLY_NOTIFY =
+    typeof process.env.WEBHOOK_UPSERT_ONLY_NOTIFY === "string" &&
+    ["1", "true", "yes", "on"].includes(process.env.WEBHOOK_UPSERT_ONLY_NOTIFY.trim().toLowerCase())
+
+const WEBHOOK_MAX_MSG_AGE_MIN = Number(process.env.WEBHOOK_MAX_MESSAGE_AGE_MINUTES)
+const webhookMaxMessageAgeMinutes =
+    Number.isFinite(WEBHOOK_MAX_MSG_AGE_MIN) && WEBHOOK_MAX_MSG_AGE_MIN > 0 ? WEBHOOK_MAX_MSG_AGE_MIN : 0
+
+function shouldForwardUpsertToWebhook({ type, messageTimestamp }) {
+    if (WEBHOOK_UPSERT_ONLY_NOTIFY && type !== "notify") {
+        return false
+    }
+    if (webhookMaxMessageAgeMinutes <= 0) {
+        return true
+    }
+    if (typeof messageTimestamp !== "number" || !Number.isFinite(messageTimestamp)) {
+        return true
+    }
+    const tsSec = messageTimestamp > 1e12 ? messageTimestamp / 1000 : messageTimestamp
+    const ageSec = Date.now() / 1000 - tsSec
+    return ageSec <= webhookMaxMessageAgeMinutes * 60
+}
+
 const rawAuthRoot = typeof process.env.WHATSAPP_AUTH_ROOT === "string" ? process.env.WHATSAPP_AUTH_ROOT.trim() : ""
 /** Produção Render: igual ao Mount Path do Persistent Disk ou env WHATSAPP_AUTH_ROOT */
 const AUTH_ROOT = path.resolve(rawAuthRoot || path.join(__dirname, "auth"))
@@ -332,6 +356,9 @@ async function startSession(sessionId) {
             for (const msg of messages || []) {
                 if (!msg?.key) continue
                 if (msg.key.remoteJid === "status@broadcast") continue
+                if (!shouldForwardUpsertToWebhook({ type, messageTimestamp: msg.messageTimestamp })) {
+                    continue
+                }
 
                 const text = getMessagePreviewText(msg)
                 postLovableWebhook({
@@ -803,5 +830,13 @@ app.listen(PORT, () => {
         console.log("⚠️ Não consegui garantir pasta AUTH_ROOT:", error?.message || error)
     }
     console.log(`📁 Auth Baileys (persistente): ${AUTH_ROOT}`)
+    if (WEBHOOK_UPSERT_ONLY_NOTIFY) {
+        console.log("📨 Webhook: apenas upsert type=notify (menos spam de sync)")
+    }
+    if (webhookMaxMessageAgeMinutes > 0) {
+        console.log(
+            `📨 Webhook: ignorando mensagens com mais de ${webhookMaxMessageAgeMinutes} min (histórico)`
+        )
+    }
     console.log(`🚀 API rodando em http://localhost:${PORT}`)
 })

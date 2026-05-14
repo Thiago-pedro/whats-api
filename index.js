@@ -44,6 +44,15 @@ const WEBHOOK_MAX_MSG_AGE_MIN = Number(process.env.WEBHOOK_MAX_MESSAGE_AGE_MINUT
 const webhookMaxMessageAgeMinutes =
     Number.isFinite(WEBHOOK_MAX_MSG_AGE_MIN) && WEBHOOK_MAX_MSG_AGE_MIN > 0 ? WEBHOOK_MAX_MSG_AGE_MIN : 0
 
+/**
+ * Sync completo de histórico no Baileys gera muitos "got history notification" e pode estourar
+ * "timed out waiting for message" em VPS/Render com pouca RAM. Para API só precisamos de mensagens novas.
+ * Ativar: WHATSAPP_SYNC_HISTORY=1
+ */
+const WHATSAPP_SYNC_HISTORY =
+    typeof process.env.WHATSAPP_SYNC_HISTORY === "string" &&
+    ["1", "true", "yes", "on"].includes(process.env.WHATSAPP_SYNC_HISTORY.trim().toLowerCase())
+
 function shouldForwardUpsertToWebhook({ type, messageTimestamp }) {
     if (WEBHOOK_UPSERT_ONLY_NOTIFY && type !== "notify") {
         return false
@@ -330,11 +339,17 @@ async function startSession(sessionId) {
         const { state, saveCreds } = await useMultiFileAuthState(authStateDir(sessionId))
         const version = await getBaileysVersionCached()
 
-        const sock = makeWASocket({
+        const socketOpts = {
             auth: state,
             version,
-            browser: ["Windows", "Chrome", "10.0"]
-        })
+            browser: ["Windows", "Chrome", "10.0"],
+            getMessage: async () => undefined
+        }
+        if (!WHATSAPP_SYNC_HISTORY) {
+            socketOpts.shouldSyncHistoryMessage = () => false
+            socketOpts.syncFullHistory = false
+        }
+        const sock = makeWASocket(socketOpts)
 
         if (!sessions[sessionId]) {
             sessions[sessionId] = createSessionRecord()
@@ -836,6 +851,11 @@ app.listen(PORT, () => {
     if (webhookMaxMessageAgeMinutes > 0) {
         console.log(
             `📨 Webhook: ignorando mensagens com mais de ${webhookMaxMessageAgeMinutes} min (histórico)`
+        )
+    }
+    if (!WHATSAPP_SYNC_HISTORY) {
+        console.log(
+            "📚 Baileys: sincronização de histórico desligada (evita timeout em sync pesado). WHATSAPP_SYNC_HISTORY=1 para ativar."
         )
     }
     console.log(`🚀 API rodando em http://localhost:${PORT}`)

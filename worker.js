@@ -12,6 +12,10 @@ const { connection } = require("./lib/redis")
 const { updateSession, getSession, registerEvent } = require("./lib/sessionStore")
 const { initDb } = require("./lib/db")
 
+const WEBHOOK_DEBUG =
+    typeof process.env.WEBHOOK_DEBUG === "string" &&
+    ["1", "true", "yes", "on"].includes(process.env.WEBHOOK_DEBUG.trim().toLowerCase())
+
 function jsonSafeStringify(obj) {
     return JSON.stringify(obj, (_k, v) => (typeof v === "bigint" ? v.toString() : v))
 }
@@ -51,9 +55,11 @@ async function postLovableWebhook(payload) {
         const preview = text.length > 200 ? text.slice(0, 200) + "…" : text
         const looksLikeHtml = /^\s*</.test(text) || (res.headers.get("content-type") || "").includes("text/html")
 
-        console.log(
-            `[WEBHOOK] ok=${res.ok} status=${res.status} event=${eventLabel} url=${url} body_preview=${JSON.stringify(preview)}`
-        )
+        if (WEBHOOK_DEBUG) {
+            console.log(
+                `[WEBHOOK] ok=${res.ok} status=${res.status} event=${eventLabel} url=${url} body_preview=${JSON.stringify(preview)}`
+            )
+        }
         if (looksLikeHtml && res.ok) {
             console.error(
                 "[WEBHOOK] A resposta parece HTML (SPA), não JSON de API — confira se LOVABLE_EVENTS_URL aponta para o endpoint real (ex.: função serverless / API), não só para o domínio do site."
@@ -506,7 +512,7 @@ async function bootstrapWorker() {
         console.error(
             "❌ LOVABLE_EVENTS_URL vazia — o worker conecta o Baileys mas NÃO enviará eventos para o Instanzia. Defina a URL completa (ex.: …/api/public/v1/whatsapp-events)."
         )
-    } else {
+    } else if (WEBHOOK_DEBUG) {
         console.log(`🔗 Webhook destino: ${String(hookUrl).trim()}`)
     }
 

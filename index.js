@@ -53,6 +53,11 @@ const WHATSAPP_SYNC_HISTORY =
     typeof process.env.WHATSAPP_SYNC_HISTORY === "string" &&
     ["1", "true", "yes", "on"].includes(process.env.WHATSAPP_SYNC_HISTORY.trim().toLowerCase())
 
+/** Logs por webhook em caso de sucesso (URL + preview). Ruído em produção. Ativar: WEBHOOK_DEBUG=1 */
+const WEBHOOK_DEBUG =
+    typeof process.env.WEBHOOK_DEBUG === "string" &&
+    ["1", "true", "yes", "on"].includes(process.env.WEBHOOK_DEBUG.trim().toLowerCase())
+
 function shouldForwardUpsertToWebhook({ type, messageTimestamp }) {
     if (WEBHOOK_UPSERT_ONLY_NOTIFY && type !== "notify") {
         return false
@@ -206,9 +211,11 @@ async function postLovableWebhook(payload) {
         const ct = String(res.headers["content-type"] || "")
         const looksLikeHtml = ct.includes("text/html") || (typeof data === "string" && /^\s*</.test(data))
 
-        console.log(
-            `[WEBHOOK] ok=${res.status >= 200 && res.status < 300} status=${res.status} event=${eventLabel} url=${url} body_preview=${preview}`
-        )
+        if (WEBHOOK_DEBUG) {
+            console.log(
+                `[WEBHOOK] ok=${res.status >= 200 && res.status < 300} status=${res.status} event=${eventLabel} url=${url} body_preview=${preview}`
+            )
+        }
         if (looksLikeHtml && res.status >= 200 && res.status < 300) {
             console.error(
                 "[WEBHOOK] A resposta parece HTML (SPA), não JSON de API — confira se LOVABLE_EVENTS_URL aponta para o endpoint real do Instanzia."

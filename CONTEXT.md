@@ -50,6 +50,7 @@ Backend Node.js (**Express + Baileys** `@whiskeysockets/baileys`) para WhatsApp 
 | `ALWAYS_REQUIRE_QR` | `true` → todo `/start` apaga credenciais e força novo QR (como `force=1`). |
 | `WEBHOOK_UPSERT_ONLY_NOTIFY` | `true` → só encaminha `messages.upsert` com `type === "notify"` (menos spam de sync). |
 | `WEBHOOK_MAX_MESSAGE_AGE_MINUTES` | Ex.: `15` → ignora no webhook mensagens mais antigas que N minutos. |
+| `WEBHOOK_DEBUG` | `1` / `true` → loga cada webhook **bem-sucedido** (URL + preview). **Default:** silencioso em sucesso; mantém `console.error` em falha. |
 | `RECONNECT_BACKOFF_BASE_MS` / `RECONNECT_BACKOFF_MAX_MS` / `RECONNECT_COOLDOWN_MS` | Backoff de reconexão (não-401). |
 | `RECONNECT_RESTART_REQUIRED_MS` | Delay curto após **515** “restart required” (pós-QR). Default ~1200 ms. |
 | `WHATSAPP_SYNC_HISTORY` | `1` / `true` → Baileys baixa **histórico completo** (mais RAM; pode dar **timeout** em host fraco). **Default (omitido):** histórico desligado (`shouldSyncHistoryMessage: () => false`, `syncFullHistory: false`). |

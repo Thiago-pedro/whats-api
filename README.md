@@ -104,7 +104,7 @@ Rotas protegidas exigem header:
 }
 ```
 
-Tipos suportados: `text` (default), `image`, `video`, `audio`, `document`. Ver `CONTEXT.md` para limites e seguranca.
+Tipos suportados: `text` (default), `image`, `video`, `audio`, `document`. Envios na mesma `session` entram em fila com intervalo minimo entre um e outro (default 5 s, variavel `SEND_MIN_INTERVAL_MS` no Render). Ver `CONTEXT.md`.
 
 ## Fluxo recomendado
 

@@ -85,6 +85,11 @@ const mediaMaxBytes =
 const JSON_BODY_LIMIT_RAW = typeof process.env.JSON_BODY_LIMIT === "string" ? process.env.JSON_BODY_LIMIT.trim() : ""
 const JSON_BODY_LIMIT = JSON_BODY_LIMIT_RAW || "32mb"
 
+/** Pausa mínima entre envios na mesma sessão (fila). 0 = desliga. Default 5000 ms. */
+const SEND_MIN_INTERVAL_MS_RAW = Number(process.env.SEND_MIN_INTERVAL_MS)
+const sendMinIntervalMs =
+    Number.isFinite(SEND_MIN_INTERVAL_MS_RAW) && SEND_MIN_INTERVAL_MS_RAW >= 0 ? SEND_MIN_INTERVAL_MS_RAW : 5000
+
 function getInstanziaEventsUrl() {
     const fromNew =
         typeof process.env.INSTANZIA_EVENTS_URL === "string" ? process.env.INSTANZIA_EVENTS_URL.trim() : ""
@@ -464,6 +469,9 @@ async function emitOutboundUpsertForCounters(sessionId, remoteJid, sent, { text,
 app.use(["/start", "/send", "/qr", "/session", "/warmup", "/health", "/events"], authMiddleware)
 
 const sessions = {}
+/** Fila por sessão: garante intervalo mínimo entre cada `sendMessage` (disparos em massa). */
+/** @type {Map<string, Promise<void>>} */
+const spacedSendTailBySession = new Map()
 /** @type {Map<string, Array<{ resolve: Function, timer: NodeJS.Timeout }>>} */
 const qrWaiters = new Map()
 /** @type {Map<string, Set<import('http').ServerResponse>>} */
@@ -524,8 +532,26 @@ function resetSession(sessionId) {
         existing.reconnectTimerId = null
     }
     closeSocketSafely(existing.sock)
+    spacedSendTailBySession.delete(sessionId)
     delete sessions[sessionId]
     return true
+}
+
+/**
+ * Fila por sessionId: um envio só começa depois do anterior terminar + pausa mínima (anti-flood).
+ * SEND_MIN_INTERVAL_MS=0 desliga a fila.
+ */
+function enqueueSpacedSend(sessionId, task) {
+    if (sendMinIntervalMs <= 0) {
+        return Promise.resolve(task())
+    }
+    const prev = spacedSendTailBySession.get(sessionId) || Promise.resolve()
+    const scheduled = prev.then(() => task())
+    spacedSendTailBySession.set(
+        sessionId,
+        scheduled.finally(() => new Promise((r) => setTimeout(r, sendMinIntervalMs))).catch(() => {})
+    )
+    return scheduled
 }
 
 function scheduleReconnect(sessionId, sock, statusCode) {
@@ -768,6 +794,7 @@ async function startSession(sessionId) {
                         sessions[sessionId].reconnectTimerId = null
                     }
                     clearAuthState(sessionId)
+                    spacedSendTailBySession.delete(sessionId)
                     delete sessions[sessionId]
                 }
             }
@@ -779,6 +806,7 @@ async function startSession(sessionId) {
             clearTimeout(sessions[sessionId].reconnectTimerId)
             sessions[sessionId].reconnectTimerId = null
         }
+        spacedSendTailBySession.delete(sessionId)
         delete sessions[sessionId]
     }
 }
@@ -807,6 +835,7 @@ function handleStart(req, res) {
             session: sessionId
         })
     } else if (sessions[sessionId]) {
+        spacedSendTailBySession.delete(sessionId)
         delete sessions[sessionId]
     }
 
@@ -848,11 +877,9 @@ app.post("/warmup", (req, res) => {
     }
 
     if (sessions[sessionId]) {
+        spacedSendTailBySession.delete(sessionId)
         delete sessions[sessionId]
     }
-
-    sessions[sessionId] = createSessionRecord()
-    setImmediate(() => startSession(sessionId))
 
     return res.status(202).json({
         ok: true,
@@ -917,111 +944,145 @@ app.post("/send", async (req, res) => {
 
     const jid = `${normalizedNumber}@s.whatsapp.net`
 
-    if (tipo === "text") {
-        const { mensagem } = body
-        if (typeof mensagem !== "string" || mensagem.trim().length === 0 || mensagem.length > 4000) {
-            return sendError(res, 400, "mensagem invalida")
-        }
-        try {
-            const sent = await sock.sendMessage(jid, { text: mensagem.trim() })
-            await emitOutboundUpsertForCounters(session, jid, sent, {
-                text: mensagem.trim(),
-                contentType: "conversation"
-            })
-            return sendSuccess(res, 200, {
-                status: "enviado",
-                session,
-                numero: normalizedNumber,
-                messageId: sent?.key?.id ?? null
-            })
-        } catch (err) {
-            console.log(err)
-            return sendError(res, 500, "falha ao enviar")
-        }
-    }
-
-    const validKinds = ["image", "video", "audio", "document"]
-    if (!validKinds.includes(tipo)) {
-        return sendError(res, 400, "tipo invalido. use: text, image, video, audio, document")
-    }
-
-    const loaded = await loadMediaBuffer(body)
-    if (loaded.error) {
-        return sendError(res, 400, loaded.error)
-    }
-
-    const ptt =
-        tipo === "audio" &&
-        (body.ptt === true ||
-            body.ptt === "true" ||
-            body.ptt === 1 ||
-            String(body.ptt || "")
-                .toLowerCase()
-                .trim() === "1")
-
-    let mime = normalizeMimeType(body.mimeType || body.mimetype || loaded.mimeHint || "")
-    if (!mimeAllowedForMediaKind(tipo, mime)) {
-        mime = defaultMimeForMediaKind(tipo, ptt)
-    }
-    if (!mimeAllowedForMediaKind(tipo, mime)) {
-        return sendError(res, 400, "mimeType invalido para este tipo; informe mimeType explicitamente")
-    }
-
-    const captionRaw = body.caption ?? body.legenda
-    let caption = ""
-    if (typeof captionRaw === "string" && captionRaw.trim()) {
-        caption = captionRaw.trim().slice(0, 1024)
-    }
-
-    const nomeArquivo =
-        typeof body.nomeArquivo === "string" && body.nomeArquivo.trim()
-            ? body.nomeArquivo.trim().slice(0, 255)
-            : tipo === "document"
-              ? "documento"
-              : undefined
-
-    let contentPayload
-    let contentTypeForWebhook
-    if (tipo === "image") {
-        contentPayload = { image: loaded.buffer, caption: caption || undefined }
-        if (mime) contentPayload.mimetype = mime
-        contentTypeForWebhook = "imageMessage"
-    } else if (tipo === "video") {
-        contentPayload = { video: loaded.buffer, mimetype: mime, caption: caption || undefined }
-        contentTypeForWebhook = "videoMessage"
-    } else if (tipo === "audio") {
-        contentPayload = {
-            audio: loaded.buffer,
-            mimetype: ptt ? "audio/ogg; codecs=opus" : mime,
-            ptt: !!ptt
-        }
-        contentTypeForWebhook = "audioMessage"
-    } else {
-        contentPayload = {
-            document: loaded.buffer,
-            mimetype: mime,
-            fileName: nomeArquivo || "arquivo",
-            caption: caption || undefined
-        }
-        contentTypeForWebhook = "documentMessage"
+    const httpThrow = (statusCode, message) => {
+        const e = new Error(message)
+        e.httpStatus = statusCode
+        e.httpError = message
+        throw e
     }
 
     try {
-        const sent = await sock.sendMessage(jid, contentPayload)
-        await emitOutboundUpsertForCounters(session, jid, sent, {
-            text: caption,
-            contentType: contentTypeForWebhook
+        if (tipo === "text") {
+            const { mensagem } = body
+            if (typeof mensagem !== "string" || mensagem.trim().length === 0 || mensagem.length > 4000) {
+                return sendError(res, 400, "mensagem invalida")
+            }
+            const trimmed = mensagem.trim()
+            const data = await enqueueSpacedSend(session, async () => {
+                const rec = sessions[session]
+                const s = rec?.sock
+                if (!rec || rec.starting || !s) {
+                    httpThrow(409, "sessao inicializando, aguarde alguns segundos")
+                }
+                if (!rec.connected) {
+                    httpThrow(409, "sessao iniciada, mas ainda nao conectada ao whatsapp")
+                }
+                const sent = await s.sendMessage(jid, { text: trimmed })
+                await emitOutboundUpsertForCounters(session, jid, sent, {
+                    text: trimmed,
+                    contentType: "conversation"
+                })
+                return {
+                    status: "enviado",
+                    session,
+                    numero: normalizedNumber,
+                    messageId: sent?.key?.id ?? null
+                }
+            })
+            if (sendMinIntervalMs > 0) {
+                data.filaIntervaloMs = sendMinIntervalMs
+            }
+            return sendSuccess(res, 200, data)
+        }
+
+        const validKinds = ["image", "video", "audio", "document"]
+        if (!validKinds.includes(tipo)) {
+            return sendError(res, 400, "tipo invalido. use: text, image, video, audio, document")
+        }
+
+        const loaded = await loadMediaBuffer(body)
+        if (loaded.error) {
+            return sendError(res, 400, loaded.error)
+        }
+
+        const ptt =
+            tipo === "audio" &&
+            (body.ptt === true ||
+                body.ptt === "true" ||
+                body.ptt === 1 ||
+                String(body.ptt || "")
+                    .toLowerCase()
+                    .trim() === "1")
+
+        let mime = normalizeMimeType(body.mimeType || body.mimetype || loaded.mimeHint || "")
+        if (!mimeAllowedForMediaKind(tipo, mime)) {
+            mime = defaultMimeForMediaKind(tipo, ptt)
+        }
+        if (!mimeAllowedForMediaKind(tipo, mime)) {
+            return sendError(res, 400, "mimeType invalido para este tipo; informe mimeType explicitamente")
+        }
+
+        const captionRaw = body.caption ?? body.legenda
+        let caption = ""
+        if (typeof captionRaw === "string" && captionRaw.trim()) {
+            caption = captionRaw.trim().slice(0, 1024)
+        }
+
+        const nomeArquivo =
+            typeof body.nomeArquivo === "string" && body.nomeArquivo.trim()
+                ? body.nomeArquivo.trim().slice(0, 255)
+                : tipo === "document"
+                  ? "documento"
+                  : undefined
+
+        let contentPayload
+        let contentTypeForWebhook
+        if (tipo === "image") {
+            contentPayload = { image: loaded.buffer, caption: caption || undefined }
+            if (mime) contentPayload.mimetype = mime
+            contentTypeForWebhook = "imageMessage"
+        } else if (tipo === "video") {
+            contentPayload = { video: loaded.buffer, mimetype: mime, caption: caption || undefined }
+            contentTypeForWebhook = "videoMessage"
+        } else if (tipo === "audio") {
+            contentPayload = {
+                audio: loaded.buffer,
+                mimetype: ptt ? "audio/ogg; codecs=opus" : mime,
+                ptt: !!ptt
+            }
+            contentTypeForWebhook = "audioMessage"
+        } else {
+            contentPayload = {
+                document: loaded.buffer,
+                mimetype: mime,
+                fileName: nomeArquivo || "arquivo",
+                caption: caption || undefined
+            }
+            contentTypeForWebhook = "documentMessage"
+        }
+
+        const data = await enqueueSpacedSend(session, async () => {
+            const rec = sessions[session]
+            const s = rec?.sock
+            if (!rec || rec.starting || !s) {
+                httpThrow(409, "sessao inicializando, aguarde alguns segundos")
+            }
+            if (!rec.connected) {
+                httpThrow(409, "sessao iniciada, mas ainda nao conectada ao whatsapp")
+            }
+            const sent = await s.sendMessage(jid, contentPayload)
+            await emitOutboundUpsertForCounters(session, jid, sent, {
+                text: caption,
+                contentType: contentTypeForWebhook
+            })
+            return {
+                status: "enviado",
+                session,
+                numero: normalizedNumber,
+                tipo,
+                messageId: sent?.key?.id ?? null
+            }
         })
-        return sendSuccess(res, 200, {
-            status: "enviado",
-            session,
-            numero: normalizedNumber,
-            tipo,
-            messageId: sent?.key?.id ?? null
-        })
+        if (sendMinIntervalMs > 0) {
+            data.filaIntervaloMs = sendMinIntervalMs
+        }
+        return sendSuccess(res, 200, data)
     } catch (err) {
+        if (err && typeof err.httpStatus === "number" && err.httpError) {
+            return sendError(res, err.httpStatus, err.httpError)
+        }
         console.log(err)
-        return sendError(res, 500, "falha ao enviar midia")
+        return sendError(res, 500, tipo === "text" ? "falha ao enviar" : "falha ao enviar midia")
     }
 })
 
@@ -1249,6 +1310,13 @@ app.listen(PORT, () => {
         console.log(`🌐 MEDIA_FETCH_ALLOWED_HOSTS: ${hosts.join(", ")}`)
     } else {
         console.log("🌐 Download de midia por URL: desligado (defina MEDIA_FETCH_ALLOWED_HOSTS para permitir https)")
+    }
+    if (sendMinIntervalMs > 0) {
+        console.log(
+            `⏱️ POST /send: fila por sessao — intervalo minimo ${sendMinIntervalMs}ms entre cada envio (SEND_MIN_INTERVAL_MS)`
+        )
+    } else {
+        console.log("⏱️ POST /send: intervalo entre envios desligado (SEND_MIN_INTERVAL_MS=0)")
     }
     console.log(`🚀 API rodando em http://localhost:${PORT}`)
 })

@@ -58,6 +58,7 @@ Backend Node.js (**Express + Baileys** `@whiskeysockets/baileys`) para WhatsApp 
 | `JSON_BODY_LIMIT` | Limite do body JSON (ex. `32mb`) para `arquivoBase64` em `/send`. |
 | `MEDIA_MAX_BYTES` | Tamanho máximo do arquivo (base64 decodificado ou download); default ~25 MB. |
 | `MEDIA_FETCH_ALLOWED_HOSTS` | Lista separada por vírgula/espaço: **somente** esses hosts podem ser usados em `url` no `/send` de mídia (HTTPS). Sem isso, **download por URL fica desligado** (base64 continua ok). |
+| `SEND_MIN_INTERVAL_MS` | Pausa mínima **entre** cada `sendMessage` na **mesma** `session` (fila global por sessão). Default **5000**. Use **0** para desligar (ex.: debug). |
 
 Outras envs (`DATABASE_URL`, `QUEUE_NAME`, …) pertencem a **`api.js` / `worker.js` / lib** — o **`index.js` não lê** `AUTH_BASE_PATH` (usar `WHATSAPP_AUTH_ROOT`).
 
@@ -87,6 +88,7 @@ Todas as rotas abaixo exigem **`x-api-key`** (incluindo **`GET /health`**).
 - **`caption` / `legenda`:** opcional (imagem, vídeo, documento); até 1024 caracteres.
 - **`nomeArquivo`:** recomendado para `document`.
 - **Áudio tipo “figurinha de voz”:** `tipo: "audio"` + `ptt: true` (WhatsApp usa OGG Opus no envio).
+- **Fila de envio (anti-disparo em massa):** por `session`, o servidor **serializa** todos os `POST /send` e impõe **pelo menos** `SEND_MIN_INTERVAL_MS` milissegundos entre o fim de um envio e o início do próximo (default 5 s). Vários pedidos em paralelo entram na fila; a resposta HTTP **só volta depois** da vez daquele pedido na fila. Quando a fila está ativa, a resposta pode incluir **`filaIntervaloMs`** (valor do intervalo) para o front mostrar progresso.
 
 Após envio bem-sucedido (texto ou mídia), o backend envia um **`messages.upsert`** sintético com `source: "api_send"` e o mesmo **`messageId`** retornado pelo Baileys, para o Instanzia **contar envios** mesmo se o eco nativo atrasar ou for filtrado. **Deduplicar por `messageId`** se também processarem o upsert nativo do Baileys (evita contagem dupla).
 
@@ -136,6 +138,7 @@ Em **`connection === "close"`** com **401**, o servidor remove sessão e **`clea
 ## Histórico já registrado neste repo
 
 - `POST /send` com **mídia** (base64 ou URL com allowlist), limites `JSON_BODY_LIMIT` / `MEDIA_MAX_BYTES`.
+- **Fila por sessão** em `/send` com `SEND_MIN_INTERVAL_MS` (default 5 s entre envios).
 - Eco **`messages.upsert`** com `source: "api_send"` para métricas de envio.
 - Webhook **`INSTANZIA_*`** com fallback **`LOVABLE_*`**; nomenclatura Instanzia (sem Chatfy).
 - Filtros opcionais de webhook; `contentType` nos upserts; QR JSON default; 515 reconexão rápida.

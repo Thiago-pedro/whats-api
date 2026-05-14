@@ -8,7 +8,11 @@ Este arquivo resume o backend e decisões recentes para qualquer sessão nova no
 
 ## Produto
 
-Backend Node.js (**Express + Baileys** `@whiskeysockets/baileys`) para WhatsApp multi-sessão. Frontend **Chatfy** (Lovable) consome a API e, em muitos casos, eventos via **webhook** (`LOVABLE_EVENTS_URL`).
+Backend Node.js (**Express + Baileys** `@whiskeysockets/baileys`) para WhatsApp multi-sessão. Frontend **Chatfy** / **Instanzia** (Lovable) consome a API e, em muitos casos, eventos via **webhook** (`LOVABLE_EVENTS_URL`).
+
+**Nomenclatura:** no Instanzia cada cartão é uma **instância**; neste repo isso é a **sessão** Baileys — o id é o **`sessionId`** (query `?session=`, pasta `auth/<sessionId>/`). Regex: 3–60 caracteres `[a-zA-Z0-9_-]`.
+
+**Vários usuários no Lovable:** cada login pode ter sessões novas (histórias isoladas). O `index.js` **não impõe** teto de instâncias; um limite (ex.: 15 clientes) é **regra de produto** no Lovable ou, se desejado, uma validação futura no `/start`. Várias sessões no mesmo processo aumentam RAM/CPU.
 
 ---
 
@@ -67,6 +71,8 @@ Todas as rotas abaixo exigem **`x-api-key`** (incluindo **`GET /health`**).
 | `GET` | `/events?session=` | SSE (opcional). |
 | `GET` | `/health` | `{ ok, data: { status, uptimeSeconds, activeSessions } }`. |
 
+No **`index.js` atual**, as rotas desta tabela (incluindo **`/health`**) passam pelo **`authMiddleware`** (`x-api-key`). Se algum README antigo disser “health sem auth”, está desatualizado em relação ao código.
+
 **`activeSessions` em `/health`** = apenas sessões **em memória** no processo atual (não espelha Supabase/Chatfy).
 
 ---
@@ -75,10 +81,18 @@ Todas as rotas abaixo exigem **`x-api-key`** (incluindo **`GET /health`**).
 
 - **`connection.update`** — `sessionId`, `connection`, `hasQr`, `disconnectStatusCode`.
 - **`qr`** — após gerar imagem: `sessionId`, `qr` (data URL), `updatedAt`.
-- **`messages.upsert`** — por mensagem (filtros opcionais acima).
-- **`messages.update`** — atualizações de status, etc.
+- **`messages.upsert`** — por mensagem (filtros opcionais acima). O payload inclui `upsertType` (ex.: **`notify`** em tempo real; **`append`** em batches de histórico). **`type === "append"`** é ignorado no handler (return antecipado) para não encaminhar rajadas típicas de sync.
+- **`messages.update`** — por atualização: `fromMe`, `from`, `messageId`, `timestamp`, **`status`** (número, enum WA/Baileys). Útil no Lovable para **entregue / lida** em mensagens **enviadas por você** (`fromMe: true`); deduplicar por `messageId` para não contar o mesmo update várias vezes. Só **`messages.upsert`** não preenche essas séries no gráfico.
 
 Em **`connection === "close"`** com **401**, o servidor remove sessão e **`clearAuthState`** (credenciais inválidas).
+
+### Alertas (produto) vs este backend
+
+| Caso | O que existe hoje |
+|------|-------------------|
+| Instância **desconectada** | Webhook **`connection.update`** + SSE **`disconnected`**; logs **`lastDisconnect`**. |
+| Instância **banida** / conta com problema | **Sem** evento dedicado; inferir por **`disconnectStatusCode`** e mensagem no log (ex. códigos 401/403 conforme cenário). |
+| **Webhook com falha** | `postLovableWebhook` em `index.js` só faz **`console.log`** em erro — **não** notifica o Instanzia; para alerta automático seria preciso instrumentação extra (métrica, fila ou URL interna). |
 
 Logs de diagnóstico: linha **`🔌 lastDisconnect [sessionId]`** com `statusCode`, `reason`, `at` (sem dados sensíveis).
 
@@ -91,6 +105,22 @@ Reconexão automática: **515** usa delay curto; outros códigos usam backoff + 
 - **Sync / histórico** após login: muitos eventos `messages.upsert` e logs Baileys level 30 — **normal**, não é necessariamente erro.
 - **QR no terminal (ASCII):** só diagnóstico; o cliente deve usar **`/qr`** ou webhook **`qr`**.
 - **Card “Conectada” no Chatfy** vs **`activeSessions: 0`:** estado da UI costuma vir do **banco/Lovable**; `/health` só conta RAM — podem divergir até o webhook/front atualizar.
+- **Uptime “do sistema” (ex. vários dias)** no canto do painel costuma ser **uptime do serviço/host**, não “tempo 100% sincronizado” daquela instância WhatsApp.
+
+### Celular recebe/envia, mas o painel não atualiza
+
+Possíveis causas (ordem prática):
+
+1. **Socket Baileys “zumbi”** — UI ainda mostra conectado, mas o processo não recebe mais `messages.upsert`. **Teste:** desconectar/reconectar a instância ou novo `/start` com o mesmo `sessionId`.
+2. **`LOVABLE_EVENTS_URL` falhando** — eventos gerados no Node, mas POST falha (só log `LOVABLE webhook falhou`). Conferir logs do Render e a edge function.
+3. **Env `WEBHOOK_UPSERT_ONLY_NOTIFY` / `WEBHOOK_MAX_MESSAGE_AGE_MINUTES`** — reduzem o que é encaminhado; conferir deploy.
+4. Mensagens só como **`append`** — o código **não** envia webhook para `append` (por design). Cenário raro para mensagem “nova”; se suspeitar, logar temporariamente `type` nos upserts.
+
+**Aparelho vinculado (iPhone):** notificações no iOS podem mudar com sessão linkada sempre ativa (semelhante ao Web desktop); não é configuração específica deste arquivo.
+
+### Múltiplos webhooks (até 3 por instância)
+
+**Não implementado** neste repo. Hoje há uma URL global (`LOVABLE_EVENTS_URL`). Evolução possível: lista de URLs no `.env` (fan-out simples) ou até 3 URLs **por `sessionId`** (exige armazenar na sessão + API para cadastrar). O ponto de acoplamento único continua sendo a função que hoje chama `axios.post` uma vez.
 
 ---
 
@@ -110,9 +140,12 @@ Reconexão automática: **515** usa delay curto; outros códigos usam backoff + 
 - **401 / DELETE:** limpeza de pasta `auth` no disco.
 - **515 pós-pareamento:** reconexão rápida para não deixar o celular em “conectando” à toa.
 - Filtros opcionais de webhook para reduzir rajada na “atividade recente”.
+- Documentação alinhada a **Instanzia**: instância = sessão; métricas entregue/lida via **`messages.update`**; limitações de alerta (webhook falho, ban); diagnóstico painel parado; multi-usuário Lovable sem teto no API; ideia de múltiplos webhooks como evolução.
 
 Se o deploy de produção migrar para **API+Worker**, revisar também **`worker.js`** e alinhar payloads com este documento.
 
 ---
+
+*Última revisão deste arquivo: 2026-05-13.*
 
 *Pedir explicitamente “ler `CONTEXT.md`” em chats novos após clone, se o time usar essa convenção.*

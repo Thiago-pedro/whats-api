@@ -23,7 +23,9 @@ Backend Node.js (**Express + Baileys** `@whiskeysockets/baileys`) para WhatsApp 
 | **Monolítico** | `npm start` → **`index.js`** | Deploy comum no **Render**: tudo (HTTP + Baileys) no mesmo processo. |
 | **API + Worker** | `npm run start:api` + `npm run start:worker` | Fila **BullMQ** / Redis; webhooks e lógica rica costumam estar em **`worker.js`**. |
 
-**Na prática atual (Instanzia + Render “whats-api”):** o serviço que roda costuma ser **`node index.js`**. Alterações de webhook/QR/sessão recentes estão em **`index.js`**, não necessariamente espelhadas no `worker.js`.
+**Na prática atual (Instanzia + Render “whats-api”):** o serviço que roda costuma ser **`node index.js`**. Alterações de webhook/QR/sessão, **mídia no `/send`**, **fila de envio** e **`contentType`** nos upserts estão em **`index.js`**. O **`worker.js`** usa `postInstanziaWebhook` e envs `INSTANZIA_*` (fallback `LOVABLE_*`), mas **não replica** a fila de `/send` nem o contrato estendido de mídia do monólito — se um dia o deploy usar **API + worker**, alinhar explicitamente.
+
+**Código remoto:** pushes na branch **`main`** do repositório GitHub ligado ao projeto; o Render costuma redeployar automaticamente após o push.
 
 ---
 
@@ -72,7 +74,7 @@ Todas as rotas abaixo exigem **`x-api-key`** (incluindo **`GET /health`**).
 |--------|------|--------|
 | `GET` / `POST` | `/start?session=&force=0\|1` | Idempotente; `force=1` ou `ALWAYS_REQUIRE_QR` limpa auth e reinicia. |
 | `POST` | `/warmup?session=` | Boot rápido; `{ warming \| alreadyRunning }`. |
-| `POST` | `/send` | Texto e **mídia** (ver secção abaixo). |
+| `POST` | `/send` | Texto e **mídia**; **fila por `session`** se `SEND_MIN_INTERVAL_MS` > 0 (ver secção abaixo). |
 | `GET` | `/qr?session=&wait=N` | Long-poll JSON; sem `wait`, **JSON por default**; HTML só com `format=html`. |
 | `DELETE` | `/session?session=` | Remove sessão em memória **e** limpa pasta auth no disco. |
 | `GET` | `/events?session=` | SSE (opcional). |
@@ -114,6 +116,15 @@ Em **`connection === "close"`** com **401**, o servidor remove sessão e **`clea
 
 ---
 
+## Desconexões (diagnóstico rápido)
+
+- O `index.js` registra **`lastDisconnect [sessionId]`** com `statusCode`, `reason`, `at` (ver `logLastDisconnect`).
+- **`401`:** sessão deslogada; credenciais apagadas; novo QR necessário.
+- **`515`:** “restart required” (comum após pareamento); reconexão rápida configurável (`RECONNECT_RESTART_REQUIRED_MS`).
+- **`428`** com *Connection Terminated* (ou mensagem equivalente): encerramento do **WebSocket** pelo WhatsApp ou rede; em geral **transitório** — o serviço agenda reconexão. Causa raiz exata raramente vem além do código/mensagem; correlacionar com deploy no Render ou instabilidade de rede.
+
+---
+
 ## Comportamento esperado (operacional)
 
 - **Contadores / gráfico:** contar **`messages.upsert`** por `messageId` (dedupe), usando **`contentType` ou `text`** (mídia costuma ter `text` vazio).
@@ -130,8 +141,8 @@ Em **`connection === "close"`** com **401**, o servidor remove sessão e **`clea
 
 1. Commit em `main`.
 2. Push → redeploy.
-3. Conferir env (`WHATSAPP_AUTH_ROOT`, `INSTANZIA_EVENTS_URL`, `MEDIA_FETCH_ALLOWED_HOSTS` se usar `url`).
-4. Validar logs de boot (`📁 Auth Baileys…`, `🔗 Webhook Instanzia…`).
+3. Conferir env (`WHATSAPP_AUTH_ROOT`, `INSTANZIA_EVENTS_URL`, `SEND_MIN_INTERVAL_MS`, `MEDIA_FETCH_ALLOWED_HOSTS` se usar `url` em mídia).
+4. Validar logs de boot (`📁 Auth Baileys…`, `🔗 Webhook Instanzia…`, linha da **fila** `/send` se aplicável).
 
 ---
 
@@ -141,12 +152,15 @@ Em **`connection === "close"`** com **401**, o servidor remove sessão e **`clea
 - **Fila por sessão** em `/send` com `SEND_MIN_INTERVAL_MS` (default 5 s entre envios).
 - Eco **`messages.upsert`** com `source: "api_send"` para métricas de envio.
 - Webhook **`INSTANZIA_*`** com fallback **`LOVABLE_*`**; nomenclatura Instanzia (sem Chatfy).
-- Filtros opcionais de webhook; `contentType` nos upserts; QR JSON default; 515 reconexão rápida.
+- Filtros opcionais de webhook; `contentType` nos upserts (contadores de mídia no Instanzia devem usar **`messageId` + (`text` ou `contentType`)**, não só `text`); QR JSON default; 515 reconexão rápida.
 
-Se o deploy migrar para **API+Worker**, revisar **`worker.js`** e alinhar payloads.
+### Retomada sugerida (próxima sessão de trabalho)
+
+- Instanzia: UI de **logs de webhooks** (se ainda não implementado) e campanhas respeitando **fila + UX de progresso** (vários `POST /send` na mesma sessão esperam na fila no servidor).
+- Opcional: alinhar **`api.js` / `worker.js`** com fila de envio e mesmo contrato de mídia do monólito, se o deploy migrar do `index.js`.
 
 ---
 
-*Última revisão deste arquivo: 2026-05-14.*
+*Última revisão deste arquivo: 2026-05-14 (fila `/send`, desconexões, monólito vs worker).*
 
 *Pedir explicitamente “ler `CONTEXT.md`” em chats novos após clone, se o time usar essa convenção.*

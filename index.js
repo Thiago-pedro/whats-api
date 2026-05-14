@@ -475,13 +475,19 @@ async function startSession(sessionId) {
             }
 
             if (connection !== undefined || lastDisconnect !== undefined) {
-                postLovableWebhook({
+                const payload = {
                     event: "connection.update",
                     sessionId,
                     connection: connection ?? null,
                     hasQr: !!qr,
                     disconnectStatusCode: lastDisconnect?.error?.output?.statusCode ?? null
-                })
+                }
+                if (connection === "open" && sock.user?.id) {
+                    const wid = String(sock.user.id)
+                    payload.me = wid
+                    payload.phone_number = wid.split("@")[0].split(":")[0]
+                }
+                postLovableWebhook(payload)
             }
 
             if (qr) {

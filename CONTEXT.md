@@ -81,7 +81,7 @@ No **`index.js` atual**, as rotas desta tabela (incluindo **`/health`**) passam 
 
 ## Webhooks enviados por `index.js` (POST JSON)
 
-- **`connection.update`** — `sessionId`, `connection`, `hasQr`, `disconnectStatusCode`.
+- **`connection.update`** — `sessionId`, `connection`, `hasQr`, `disconnectStatusCode`; com **`connection === "open"`** também envia **`me`** (JID) e **`phone_number`** (só dígitos) para o front atualizar o cartão após reconexão sem QR.
 - **`qr`** — após gerar imagem: `sessionId`, `qr` (data URL), `updatedAt`.
 - **`messages.upsert`** — por mensagem (filtros opcionais acima). O payload inclui `upsertType` (ex.: **`notify`** em tempo real; **`append`** em batches de histórico). **`type === "append"`** é ignorado no handler (return antecipado) para não encaminhar rajadas típicas de sync.
 - **`messages.update`** — por atualização: `fromMe`, `from`, `messageId`, `timestamp`, **`status`** (número, enum WA/Baileys). Útil no Lovable para **entregue / lida** em mensagens **enviadas por você** (`fromMe: true`); deduplicar por `messageId` para não contar o mesmo update várias vezes. Só **`messages.upsert`** não preenche essas séries no gráfico.

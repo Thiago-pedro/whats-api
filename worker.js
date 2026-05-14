@@ -16,11 +16,21 @@ function jsonSafeStringify(obj) {
     return JSON.stringify(obj, (_k, v) => (typeof v === "bigint" ? v.toString() : v))
 }
 
-async function postLovableWebhook(payload) {
-    const url = process.env.LOVABLE_EVENTS_URL
-    if (!url) return
+function webhookEventLabel(payload) {
+    if (!payload || typeof payload !== "object") return "(sem tipo)"
+    return payload.event ?? payload.type ?? "(sem event/type)"
+}
 
-    console.log("[WEBHOOK OUT]", jsonSafeStringify(payload))
+async function postLovableWebhook(payload) {
+    const urlRaw = process.env.LOVABLE_EVENTS_URL
+    if (!urlRaw || typeof urlRaw !== "string") {
+        console.error("[WEBHOOK] LOVABLE_EVENTS_URL não definida — evento descartado:", webhookEventLabel(payload))
+        return
+    }
+
+    const url = urlRaw.trim()
+    const eventLabel = webhookEventLabel(payload)
+    const bodyStr = jsonSafeStringify(payload)
 
     try {
         const headers = {
@@ -31,13 +41,40 @@ async function postLovableWebhook(payload) {
             headers["x-webhook-secret"] = process.env.LOVABLE_WEBHOOK_SECRET
         }
 
-        await fetch(url, {
+        const res = await fetch(url, {
             method: "POST",
             headers,
-            body: jsonSafeStringify(payload)
+            body: bodyStr
         })
+
+        const text = await res.text()
+        const preview = text.length > 200 ? text.slice(0, 200) + "…" : text
+        const looksLikeHtml = /^\s*</.test(text) || (res.headers.get("content-type") || "").includes("text/html")
+
+        console.log(
+            `[WEBHOOK] ok=${res.ok} status=${res.status} event=${eventLabel} url=${url} body_preview=${JSON.stringify(preview)}`
+        )
+        if (looksLikeHtml && res.ok) {
+            console.error(
+                "[WEBHOOK] A resposta parece HTML (SPA), não JSON de API — confira se LOVABLE_EVENTS_URL aponta para o endpoint real (ex.: função serverless / API), não só para o domínio do site."
+            )
+        }
+
+        if (!res.ok) {
+            console.error(
+                "[WEBHOOK] resposta HTTP não OK:",
+                JSON.stringify({ url, method: "POST", status: res.status, event: eventLabel, body_preview: preview })
+            )
+        }
     } catch (error) {
-        console.log("⚠️ LOVABLE webhook falhou:", error?.message || error)
+        console.error(
+            "[WEBHOOK] falha de rede ou exceção:",
+            JSON.stringify({
+                url,
+                event: eventLabel,
+                message: error?.message || String(error)
+            })
+        )
     }
 }
 
@@ -463,6 +500,15 @@ async function bootstrapWorker() {
     worker.on("completed", (job) => {
         console.log(`✅ Job concluido: ${job.name} (${job.id})`)
     })
+
+    const hookUrl = process.env.LOVABLE_EVENTS_URL
+    if (!hookUrl || !String(hookUrl).trim()) {
+        console.error(
+            "❌ LOVABLE_EVENTS_URL vazia — o worker conecta o Baileys mas NÃO enviará eventos para o Instanzia. Defina a URL completa (ex.: …/api/public/v1/whatsapp-events)."
+        )
+    } else {
+        console.log(`🔗 Webhook destino: ${String(hookUrl).trim()}`)
+    }
 
     console.log(`👷 Worker ${config.WORKER_ID} ouvindo fila ${config.QUEUE_NAME}`)
 }

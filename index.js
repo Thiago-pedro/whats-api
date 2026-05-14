@@ -172,18 +172,74 @@ function logLastDisconnect(sessionId, lastDisconnect) {
     )
 }
 
-async function postLovableWebhook(payload) {
-    const url = process.env.LOVABLE_EVENTS_URL
-    if (!url || typeof url !== "string") return
+function webhookEventLabel(payload) {
+    if (!payload || typeof payload !== "object") return "(sem tipo)"
+    return payload.event ?? payload.type ?? "(sem event/type)"
+}
 
+async function postLovableWebhook(payload) {
+    const urlRaw = process.env.LOVABLE_EVENTS_URL
+    if (!urlRaw || typeof urlRaw !== "string") {
+        console.error("[WEBHOOK] LOVABLE_EVENTS_URL não definida — evento descartado:", webhookEventLabel(payload))
+        return
+    }
+
+    const url = urlRaw.trim()
     const secret = process.env.LOVABLE_WEBHOOK_SECRET
     const headers = { "Content-Type": "application/json" }
     if (secret) headers["x-webhook-secret"] = secret
 
+    const eventLabel = webhookEventLabel(payload)
+
     try {
-        await axios.post(url.trim(), payload, { timeout: 15000, headers })
+        const res = await axios.post(url, payload, { timeout: 15000, headers, validateStatus: () => true })
+        const data = res.data
+        const preview =
+            typeof data === "string"
+                ? data.length > 200
+                    ? data.slice(0, 200) + "…"
+                    : data
+                : JSON.stringify(data).length > 200
+                  ? JSON.stringify(data).slice(0, 200) + "…"
+                  : JSON.stringify(data)
+
+        const ct = String(res.headers["content-type"] || "")
+        const looksLikeHtml = ct.includes("text/html") || (typeof data === "string" && /^\s*</.test(data))
+
+        console.log(
+            `[WEBHOOK] ok=${res.status >= 200 && res.status < 300} status=${res.status} event=${eventLabel} url=${url} body_preview=${preview}`
+        )
+        if (looksLikeHtml && res.status >= 200 && res.status < 300) {
+            console.error(
+                "[WEBHOOK] A resposta parece HTML (SPA), não JSON de API — confira se LOVABLE_EVENTS_URL aponta para o endpoint real do Instanzia."
+            )
+        }
+        if (res.status < 200 || res.status >= 300) {
+            console.error(
+                "[WEBHOOK] resposta HTTP não OK:",
+                JSON.stringify({ url, method: "POST", status: res.status, event: eventLabel, body_preview: preview })
+            )
+        }
     } catch (error) {
-        console.log("⚠️ LOVABLE webhook falhou:", error?.message || error)
+        const status = error.response?.status
+        const respData = error.response?.data
+        let preview = ""
+        try {
+            const s = typeof respData === "string" ? respData : JSON.stringify(respData)
+            preview = s.length > 200 ? s.slice(0, 200) + "…" : s
+        } catch {
+            preview = "(sem corpo)"
+        }
+        console.error(
+            "[WEBHOOK] falha:",
+            JSON.stringify({
+                url,
+                event: eventLabel,
+                message: error?.message || String(error),
+                status: status ?? null,
+                body_preview: preview || null
+            })
+        )
     }
 }
 

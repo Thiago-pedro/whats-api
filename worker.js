@@ -25,14 +25,33 @@ function webhookEventLabel(payload) {
     return payload.event ?? payload.type ?? "(sem event/type)"
 }
 
-async function postLovableWebhook(payload) {
-    const urlRaw = process.env.LOVABLE_EVENTS_URL
-    if (!urlRaw || typeof urlRaw !== "string") {
-        console.error("[WEBHOOK] LOVABLE_EVENTS_URL não definida — evento descartado:", webhookEventLabel(payload))
+function getInstanziaEventsUrl() {
+    const fromNew =
+        typeof process.env.INSTANZIA_EVENTS_URL === "string" ? process.env.INSTANZIA_EVENTS_URL.trim() : ""
+    if (fromNew) return fromNew
+    const legacy =
+        typeof process.env.LOVABLE_EVENTS_URL === "string" ? process.env.LOVABLE_EVENTS_URL.trim() : ""
+    return legacy
+}
+
+function getInstanziaWebhookSecret() {
+    const fromNew =
+        typeof process.env.INSTANZIA_WEBHOOK_SECRET === "string"
+            ? process.env.INSTANZIA_WEBHOOK_SECRET.trim()
+            : ""
+    if (fromNew) return fromNew
+    const legacy =
+        typeof process.env.LOVABLE_WEBHOOK_SECRET === "string" ? process.env.LOVABLE_WEBHOOK_SECRET.trim() : ""
+    return legacy
+}
+
+async function postInstanziaWebhook(payload) {
+    const url = getInstanziaEventsUrl()
+    if (!url) {
+        console.error("[WEBHOOK] INSTANZIA_EVENTS_URL nao definida — evento descartado:", webhookEventLabel(payload))
         return
     }
 
-    const url = urlRaw.trim()
     const eventLabel = webhookEventLabel(payload)
     const bodyStr = jsonSafeStringify(payload)
 
@@ -41,8 +60,9 @@ async function postLovableWebhook(payload) {
             "Content-Type": "application/json"
         }
 
-        if (process.env.LOVABLE_WEBHOOK_SECRET) {
-            headers["x-webhook-secret"] = process.env.LOVABLE_WEBHOOK_SECRET
+        const secret = getInstanziaWebhookSecret()
+        if (secret) {
+            headers["x-webhook-secret"] = secret
         }
 
         const res = await fetch(url, {
@@ -62,19 +82,19 @@ async function postLovableWebhook(payload) {
         }
         if (looksLikeHtml && res.ok) {
             console.error(
-                "[WEBHOOK] A resposta parece HTML (SPA), não JSON de API — confira se LOVABLE_EVENTS_URL aponta para o endpoint real (ex.: função serverless / API), não só para o domínio do site."
+                "[WEBHOOK] A resposta parece HTML (SPA), nao JSON de API — confira se INSTANZIA_EVENTS_URL aponta para o endpoint correto."
             )
         }
 
         if (!res.ok) {
             console.error(
-                "[WEBHOOK] resposta HTTP não OK:",
+                "[WEBHOOK] resposta HTTP nao OK:",
                 JSON.stringify({ url, method: "POST", status: res.status, event: eventLabel, body_preview: preview })
             )
         }
     } catch (error) {
         console.error(
-            "[WEBHOOK] falha de rede ou exceção:",
+            "[WEBHOOK] falha de rede ou excecao:",
             JSON.stringify({
                 url,
                 event: eventLabel,
@@ -163,7 +183,7 @@ function classifyInnerForWebhook(inner) {
     return { allowedKey }
 }
 
-function shouldForwardUpsertToChatfy(msg) {
+function shouldForwardUpsertToInstanzia(msg) {
     if (msg.messageStubType != null) return false
     if (msg.key?.remoteJid === "status@broadcast") return false
     if (!msg.message || typeof msg.message !== "object") return false
@@ -290,7 +310,7 @@ async function startSession(sessionId, tenantId) {
                 lastError: null
             })
             await registerEvent(sessionId, tenantId, "connected")
-            postLovableWebhook(buildConnectionWebhookPayload(sessionId, sock, "open"))
+            postInstanziaWebhook(buildConnectionWebhookPayload(sessionId, sock, "open"))
             console.log(`✅ Sessao ${sessionId} conectada`)
         }
 
@@ -311,7 +331,7 @@ async function startSession(sessionId, tenantId) {
                 statusCode: statusCode || null,
                 loggedOut
             })
-            postLovableWebhook(
+            postInstanziaWebhook(
                 buildConnectionWebhookPayload(
                     sessionId,
                     sock,
@@ -340,7 +360,7 @@ async function startSession(sessionId, tenantId) {
             const st = u.update?.status
             if (st == null) continue
 
-            postLovableWebhook({
+            postInstanziaWebhook({
                 sessionId,
                 type: "message.status",
                 me: userId,
@@ -358,7 +378,7 @@ async function startSession(sessionId, tenantId) {
     sock.ev.on("messages.upsert", async ({ messages }) => {
         for (const msg of messages || []) {
             if (!msg?.message) continue
-            if (!shouldForwardUpsertToChatfy(msg)) continue
+            if (!shouldForwardUpsertToInstanzia(msg)) continue
 
             const texto = extractMessageText(msg)
             const inner = unwrapMessageNode(msg.message)
@@ -405,7 +425,7 @@ async function startSession(sessionId, tenantId) {
                 })
             }
 
-            postLovableWebhook(
+            postInstanziaWebhook(
                 buildMessageWebhookPayload(sessionId, sock, {
                     direction,
                     fromDigits,
@@ -451,7 +471,7 @@ async function sendMessage({ sessionId, tenantId, numero, mensagem }) {
     const toDigits =
         (await resolveJidToPn(sock, `${numero}@s.whatsapp.net`)) ||
         toDigitsPn(numero)
-    postLovableWebhook(
+    postInstanziaWebhook(
         buildMessageWebhookPayload(sessionId, sock, {
             direction: "outbound",
             fromDigits: instanceDigits,
@@ -507,13 +527,13 @@ async function bootstrapWorker() {
         console.log(`✅ Job concluido: ${job.name} (${job.id})`)
     })
 
-    const hookUrl = process.env.LOVABLE_EVENTS_URL
-    if (!hookUrl || !String(hookUrl).trim()) {
+    const hookUrl = getInstanziaEventsUrl()
+    if (!hookUrl) {
         console.error(
-            "❌ LOVABLE_EVENTS_URL vazia — o worker conecta o Baileys mas NÃO enviará eventos para o Instanzia. Defina a URL completa (ex.: …/api/public/v1/whatsapp-events)."
+            "❌ INSTANZIA_EVENTS_URL (ou LOVABLE_EVENTS_URL legado) vazia — o worker conecta o Baileys mas NAO enviara eventos. Defina a URL completa do webhook."
         )
     } else if (WEBHOOK_DEBUG) {
-        console.log(`🔗 Webhook destino: ${String(hookUrl).trim()}`)
+        console.log(`🔗 Webhook destino: ${hookUrl}`)
     }
 
     console.log(`👷 Worker ${config.WORKER_ID} ouvindo fila ${config.QUEUE_NAME}`)

@@ -3,6 +3,7 @@ const cors = require("cors")
 const axios = require("axios")
 const fs = require("fs")
 const path = require("path")
+const { URL } = require("url")
 require("dotenv").config()
 const {
     default: makeWASocket,
@@ -77,11 +78,38 @@ const rawAuthRoot = typeof process.env.WHATSAPP_AUTH_ROOT === "string" ? process
 /** Produção Render: igual ao Mount Path do Persistent Disk ou env WHATSAPP_AUTH_ROOT */
 const AUTH_ROOT = path.resolve(rawAuthRoot || path.join(__dirname, "auth"))
 
+const MEDIA_MAX_BYTES_RAW = Number(process.env.MEDIA_MAX_BYTES)
+const mediaMaxBytes =
+    Number.isFinite(MEDIA_MAX_BYTES_RAW) && MEDIA_MAX_BYTES_RAW > 0 ? MEDIA_MAX_BYTES_RAW : 25 * 1024 * 1024
+
+const JSON_BODY_LIMIT_RAW = typeof process.env.JSON_BODY_LIMIT === "string" ? process.env.JSON_BODY_LIMIT.trim() : ""
+const JSON_BODY_LIMIT = JSON_BODY_LIMIT_RAW || "32mb"
+
+function getInstanziaEventsUrl() {
+    const fromNew =
+        typeof process.env.INSTANZIA_EVENTS_URL === "string" ? process.env.INSTANZIA_EVENTS_URL.trim() : ""
+    if (fromNew) return fromNew
+    const legacy =
+        typeof process.env.LOVABLE_EVENTS_URL === "string" ? process.env.LOVABLE_EVENTS_URL.trim() : ""
+    return legacy
+}
+
+function getInstanziaWebhookSecret() {
+    const fromNew =
+        typeof process.env.INSTANZIA_WEBHOOK_SECRET === "string"
+            ? process.env.INSTANZIA_WEBHOOK_SECRET.trim()
+            : ""
+    if (fromNew) return fromNew
+    const legacy =
+        typeof process.env.LOVABLE_WEBHOOK_SECRET === "string" ? process.env.LOVABLE_WEBHOOK_SECRET.trim() : ""
+    return legacy
+}
+
 function authStateDir(sessionId) {
     return path.join(AUTH_ROOT, sessionId)
 }
 
-app.use(express.json())
+app.use(express.json({ limit: JSON_BODY_LIMIT }))
 app.use(cors({ origin: CORS_ORIGIN === "*" ? true : CORS_ORIGIN }))
 
 if (!API_KEY) {
@@ -142,6 +170,23 @@ function getMessagePreviewText(msg) {
     }
 }
 
+/** Tipo Baileys (ex.: audioMessage, imageMessage) — útil no painel para contar mídia quando `text` vem vazio */
+function getMessageContentTypeTag(msg) {
+    try {
+        const extracted = extractMessageContent(msg?.message)
+        if (extracted) {
+            const t = getContentType(extracted)
+            if (typeof t === "string" && t) return t
+        }
+    } catch {
+        /* ignore */
+    }
+    const raw = msg?.message
+    if (!raw || typeof raw !== "object") return null
+    const keys = Object.keys(raw).filter((k) => k.endsWith("Message") || k === "conversation")
+    return keys[0] ?? null
+}
+
 function logLastDisconnect(sessionId, lastDisconnect) {
     if (!lastDisconnect) {
         console.log(`🔌 lastDisconnect [${sessionId}]: (sem detalhes)`)
@@ -182,15 +227,155 @@ function webhookEventLabel(payload) {
     return payload.event ?? payload.type ?? "(sem event/type)"
 }
 
-async function postLovableWebhook(payload) {
-    const urlRaw = process.env.LOVABLE_EVENTS_URL
-    if (!urlRaw || typeof urlRaw !== "string") {
-        console.error("[WEBHOOK] LOVABLE_EVENTS_URL não definida — evento descartado:", webhookEventLabel(payload))
+function parseMediaUrlAllowedHosts() {
+    const raw = process.env.MEDIA_FETCH_ALLOWED_HOSTS
+    if (!raw || typeof raw !== "string") return []
+    return raw
+        .split(/[,;\s]+/)
+        .map((h) => h.trim().toLowerCase())
+        .filter((h) => h.length > 0)
+}
+
+function hostnameAllowedForMediaUrl(hostname) {
+    const host = String(hostname)
+        .toLowerCase()
+        .replace(/\.$/, "")
+    const list = parseMediaUrlAllowedHosts()
+    if (!list.length) return false
+    for (const rule of list) {
+        if (host === rule) return true
+        if (host.endsWith("." + rule)) return true
+    }
+    return false
+}
+
+function decodeDataOrBase64(arquivoBase64) {
+    if (typeof arquivoBase64 !== "string" || !arquivoBase64.trim()) {
+        return { error: "arquivoBase64 ausente ou invalido" }
+    }
+    const s = arquivoBase64.trim()
+    const m = /^data:([^;]+);base64,(.+)$/is.exec(s)
+    if (m) {
+        try {
+            const buf = Buffer.from(m[2].replace(/\s/g, ""), "base64")
+            if (!buf.length) return { error: "base64 vazio (data uri)" }
+            return { buffer: buf, mimeHint: m[1].trim().toLowerCase().split(";")[0] }
+        } catch {
+            return { error: "base64 invalido (data uri)" }
+        }
+    }
+    try {
+        const buf = Buffer.from(s.replace(/\s/g, ""), "base64")
+        if (buf.length < 8) return { error: "arquivo muito pequeno ou base64 invalido" }
+        return { buffer: buf }
+    } catch {
+        return { error: "base64 invalido" }
+    }
+}
+
+async function loadMediaBuffer(body) {
+    const url = typeof body.url === "string" ? body.url.trim() : ""
+    const hasUrl = Boolean(url)
+    const hasB64 =
+        body.arquivoBase64 != null &&
+        typeof body.arquivoBase64 === "string" &&
+        body.arquivoBase64.trim().length > 0
+
+    if (hasUrl && hasB64) {
+        return { error: "use apenas url ou arquivoBase64, nao os dois" }
+    }
+    if (!hasUrl && !hasB64) {
+        return { error: "informe url ou arquivoBase64" }
+    }
+
+    if (hasUrl) {
+        if (!/^https:/i.test(url)) {
+            return { error: "url de midia deve ser https" }
+        }
+        let parsed
+        try {
+            parsed = new URL(url)
+        } catch {
+            return { error: "url invalida" }
+        }
+        if (!hostnameAllowedForMediaUrl(parsed.hostname)) {
+            return {
+                error:
+                    "host da url nao permitido. defina MEDIA_FETCH_ALLOWED_HOSTS (ex: cdn.seudominio.com,storage.supabase.co)"
+            }
+        }
+        try {
+            const res = await axios.get(url, {
+                responseType: "arraybuffer",
+                maxContentLength: mediaMaxBytes,
+                maxBodyLength: mediaMaxBytes,
+                timeout: 45000,
+                maxRedirects: 3,
+                validateStatus: (st) => st >= 200 && st < 300
+            })
+            const buffer = Buffer.from(res.data)
+            if (buffer.length > mediaMaxBytes) {
+                return { error: `arquivo maior que limite (${mediaMaxBytes} bytes)` }
+            }
+            const ct = String(res.headers["content-type"] || "")
+                .split(";")[0]
+                .trim()
+                .toLowerCase()
+            return { buffer, mimeHint: ct || null }
+        } catch (e) {
+            const msg = e?.response?.status ? `download http ${e.response.status}` : e?.message || "download falhou"
+            return { error: msg }
+        }
+    }
+
+    const dec = decodeDataOrBase64(body.arquivoBase64)
+    if (dec.error) return dec
+    if (dec.buffer.length > mediaMaxBytes) {
+        return { error: `arquivo maior que limite (${mediaMaxBytes} bytes)` }
+    }
+    return { buffer: dec.buffer, mimeHint: dec.mimeHint || null }
+}
+
+function normalizeMimeType(m) {
+    if (typeof m !== "string") return ""
+    return m.split(";")[0].trim().toLowerCase()
+}
+
+const RISKY_MEDIA_MIME = /javascript|html\+|\/html$|x-msdownload|mshta|xbap/i
+
+function mimeAllowedForMediaKind(kind, mime) {
+    const m = normalizeMimeType(mime)
+    if (!m || RISKY_MEDIA_MIME.test(m)) return false
+    if (kind === "image") return /^image\/(jpeg|jpg|png|gif|webp)$/.test(m)
+    if (kind === "video") return /^video\/(mp4|quicktime|3gpp|webm)$/.test(m)
+    if (kind === "audio") {
+        return (
+            /^audio\/(mpeg|mp3|mp4|ogg|opus|aac|webm|wav|x-wav|m4a|x-m4a|3gpp)$/.test(m) || m === "audio/ogg"
+        )
+    }
+    if (kind === "document") return m.length > 1 && m.length < 180
+    return false
+}
+
+function defaultMimeForMediaKind(kind, ptt) {
+    if (kind === "image") return "image/jpeg"
+    if (kind === "video") return "video/mp4"
+    if (kind === "audio") return ptt ? "audio/ogg" : "audio/mpeg"
+    if (kind === "document") return "application/pdf"
+    return "application/octet-stream"
+}
+
+async function postInstanziaWebhook(payload) {
+    const url = getInstanziaEventsUrl()
+    if (!url) {
+        console.error(
+            "[WEBHOOK] INSTANZIA_EVENTS_URL (ou LOVABLE_EVENTS_URL legado) nao definida — evento descartado:",
+            webhookEventLabel(payload)
+        )
         return
     }
 
-    const url = urlRaw.trim()
-    const secret = process.env.LOVABLE_WEBHOOK_SECRET
+    const secret = getInstanziaWebhookSecret()
     const headers = { "Content-Type": "application/json" }
     if (secret) headers["x-webhook-secret"] = secret
 
@@ -218,12 +403,12 @@ async function postLovableWebhook(payload) {
         }
         if (looksLikeHtml && res.status >= 200 && res.status < 300) {
             console.error(
-                "[WEBHOOK] A resposta parece HTML (SPA), não JSON de API — confira se LOVABLE_EVENTS_URL aponta para o endpoint real do Instanzia."
+                "[WEBHOOK] A resposta parece HTML (SPA), nao JSON de API — confira se INSTANZIA_EVENTS_URL aponta para o endpoint correto."
             )
         }
         if (res.status < 200 || res.status >= 300) {
             console.error(
-                "[WEBHOOK] resposta HTTP não OK:",
+                "[WEBHOOK] resposta HTTP nao OK:",
                 JSON.stringify({ url, method: "POST", status: res.status, event: eventLabel, body_preview: preview })
             )
         }
@@ -248,6 +433,32 @@ async function postLovableWebhook(payload) {
             })
         )
     }
+}
+
+/**
+ * Eco em formato messages.upsert para o Instanzia contar envios (texto/midia) mesmo se o upsert do Baileys atrasar ou for filtrado.
+ * Deduplicar por messageId se o servidor tambem receber o mesmo evento nativo.
+ */
+async function emitOutboundUpsertForCounters(sessionId, remoteJid, sent, { text, contentType }) {
+    const messageId = sent?.key?.id
+    if (!messageId) return
+    const rawTs = sent?.messageTimestamp
+    const ts =
+        typeof rawTs === "number" && Number.isFinite(rawTs)
+            ? rawTs
+            : Math.floor(Date.now() / 1000)
+    await postInstanziaWebhook({
+        event: "messages.upsert",
+        sessionId,
+        fromMe: true,
+        from: remoteJid,
+        text: typeof text === "string" ? text : "",
+        contentType: contentType ?? null,
+        messageId,
+        timestamp: ts,
+        upsertType: "notify",
+        source: "api_send"
+    })
 }
 
 app.use(["/start", "/send", "/qr", "/session", "/warmup", "/health", "/events"], authMiddleware)
@@ -439,12 +650,14 @@ async function startSession(sessionId) {
                 }
 
                 const text = getMessagePreviewText(msg)
-                postLovableWebhook({
+                const contentType = getMessageContentTypeTag(msg)
+                postInstanziaWebhook({
                     event: "messages.upsert",
                     sessionId,
                     fromMe: !!msg.key.fromMe,
                     from: msg.key.remoteJid,
                     text,
+                    contentType,
                     timestamp: msg.messageTimestamp,
                     messageId: msg.key.id,
                     upsertType: type
@@ -455,7 +668,7 @@ async function startSession(sessionId) {
         sock.ev.on("messages.update", (updates) => {
             for (const u of updates || []) {
                 if (!u?.key) continue
-                postLovableWebhook({
+                postInstanziaWebhook({
                     event: "messages.update",
                     sessionId,
                     fromMe: !!u.key.fromMe,
@@ -487,7 +700,7 @@ async function startSession(sessionId) {
                     payload.me = wid
                     payload.phone_number = wid.split("@")[0].split(":")[0]
                 }
-                postLovableWebhook(payload)
+                postInstanziaWebhook(payload)
             }
 
             if (qr) {
@@ -497,7 +710,7 @@ async function startSession(sessionId) {
                     sessions[sessionId].qrUpdatedAt = new Date().toISOString()
                 }
                 const qrDataUrl = sessions[sessionId]?.qrCode
-                postLovableWebhook({
+                postInstanziaWebhook({
                     event: "qr",
                     sessionId,
                     qr: qrDataUrl,
@@ -670,7 +883,13 @@ app.delete("/session", (req, res) => {
 })
 
 app.post("/send", async (req, res) => {
-    const { session, numero, mensagem } = req.body || {}
+    const body = req.body || {}
+    const { session, numero } = body
+    const tipoRaw = body.tipo
+    const tipo =
+        typeof tipoRaw === "string" && tipoRaw.trim()
+            ? tipoRaw.trim().toLowerCase()
+            : "text"
 
     if (!isValidSessionId(session)) {
         return sendError(res, 400, "session invalida")
@@ -679,10 +898,6 @@ app.post("/send", async (req, res) => {
     const normalizedNumber = normalizePhoneNumber(numero)
     if (!normalizedNumber) {
         return sendError(res, 400, "numero invalido")
-    }
-
-    if (typeof mensagem !== "string" || mensagem.trim().length === 0 || mensagem.length > 4000) {
-        return sendError(res, 400, "mensagem invalida")
     }
 
     const sessionData = sessions[session]
@@ -700,19 +915,113 @@ app.post("/send", async (req, res) => {
         return sendError(res, 409, "sessao iniciada, mas ainda nao conectada ao whatsapp")
     }
 
-    try {
-        await sock.sendMessage(normalizedNumber + "@s.whatsapp.net", {
-            text: mensagem.trim()
-        })
+    const jid = `${normalizedNumber}@s.whatsapp.net`
 
+    if (tipo === "text") {
+        const { mensagem } = body
+        if (typeof mensagem !== "string" || mensagem.trim().length === 0 || mensagem.length > 4000) {
+            return sendError(res, 400, "mensagem invalida")
+        }
+        try {
+            const sent = await sock.sendMessage(jid, { text: mensagem.trim() })
+            await emitOutboundUpsertForCounters(session, jid, sent, {
+                text: mensagem.trim(),
+                contentType: "conversation"
+            })
+            return sendSuccess(res, 200, {
+                status: "enviado",
+                session,
+                numero: normalizedNumber,
+                messageId: sent?.key?.id ?? null
+            })
+        } catch (err) {
+            console.log(err)
+            return sendError(res, 500, "falha ao enviar")
+        }
+    }
+
+    const validKinds = ["image", "video", "audio", "document"]
+    if (!validKinds.includes(tipo)) {
+        return sendError(res, 400, "tipo invalido. use: text, image, video, audio, document")
+    }
+
+    const loaded = await loadMediaBuffer(body)
+    if (loaded.error) {
+        return sendError(res, 400, loaded.error)
+    }
+
+    const ptt =
+        tipo === "audio" &&
+        (body.ptt === true ||
+            body.ptt === "true" ||
+            body.ptt === 1 ||
+            String(body.ptt || "")
+                .toLowerCase()
+                .trim() === "1")
+
+    let mime = normalizeMimeType(body.mimeType || body.mimetype || loaded.mimeHint || "")
+    if (!mimeAllowedForMediaKind(tipo, mime)) {
+        mime = defaultMimeForMediaKind(tipo, ptt)
+    }
+    if (!mimeAllowedForMediaKind(tipo, mime)) {
+        return sendError(res, 400, "mimeType invalido para este tipo; informe mimeType explicitamente")
+    }
+
+    const captionRaw = body.caption ?? body.legenda
+    let caption = ""
+    if (typeof captionRaw === "string" && captionRaw.trim()) {
+        caption = captionRaw.trim().slice(0, 1024)
+    }
+
+    const nomeArquivo =
+        typeof body.nomeArquivo === "string" && body.nomeArquivo.trim()
+            ? body.nomeArquivo.trim().slice(0, 255)
+            : tipo === "document"
+              ? "documento"
+              : undefined
+
+    let contentPayload
+    let contentTypeForWebhook
+    if (tipo === "image") {
+        contentPayload = { image: loaded.buffer, caption: caption || undefined }
+        if (mime) contentPayload.mimetype = mime
+        contentTypeForWebhook = "imageMessage"
+    } else if (tipo === "video") {
+        contentPayload = { video: loaded.buffer, mimetype: mime, caption: caption || undefined }
+        contentTypeForWebhook = "videoMessage"
+    } else if (tipo === "audio") {
+        contentPayload = {
+            audio: loaded.buffer,
+            mimetype: ptt ? "audio/ogg; codecs=opus" : mime,
+            ptt: !!ptt
+        }
+        contentTypeForWebhook = "audioMessage"
+    } else {
+        contentPayload = {
+            document: loaded.buffer,
+            mimetype: mime,
+            fileName: nomeArquivo || "arquivo",
+            caption: caption || undefined
+        }
+        contentTypeForWebhook = "documentMessage"
+    }
+
+    try {
+        const sent = await sock.sendMessage(jid, contentPayload)
+        await emitOutboundUpsertForCounters(session, jid, sent, {
+            text: caption,
+            contentType: contentTypeForWebhook
+        })
         return sendSuccess(res, 200, {
             status: "enviado",
             session,
-            numero: normalizedNumber
+            numero: normalizedNumber,
+            tipo,
+            messageId: sent?.key?.id ?? null
         })
     } catch (err) {
         console.log(err)
-        return sendError(res, 500, "falha ao enviar")
+        return sendError(res, 500, "falha ao enviar midia")
     }
 })
 
@@ -926,6 +1235,20 @@ app.listen(PORT, () => {
         console.log(
             "📚 Baileys: sincronização de histórico desligada (evita timeout em sync pesado). WHATSAPP_SYNC_HISTORY=1 para ativar."
         )
+    }
+    const eventsUrl = getInstanziaEventsUrl()
+    if (eventsUrl) {
+        const short = eventsUrl.length > 72 ? `${eventsUrl.slice(0, 72)}…` : eventsUrl
+        console.log(`🔗 Webhook Instanzia (POST): ${short}`)
+    } else {
+        console.log("⚠️ INSTANZIA_EVENTS_URL nao definida — webhooks nao serao enviados")
+    }
+    console.log(`📦 JSON body limit: ${JSON_BODY_LIMIT} | midia max: ${mediaMaxBytes} bytes`)
+    const hosts = parseMediaUrlAllowedHosts()
+    if (hosts.length) {
+        console.log(`🌐 MEDIA_FETCH_ALLOWED_HOSTS: ${hosts.join(", ")}`)
+    } else {
+        console.log("🌐 Download de midia por URL: desligado (defina MEDIA_FETCH_ALLOWED_HOSTS para permitir https)")
     }
     console.log(`🚀 API rodando em http://localhost:${PORT}`)
 })

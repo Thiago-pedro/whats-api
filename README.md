@@ -6,7 +6,7 @@ Backend em Node.js (Express + Baileys) com dois modos de execucao.
 
 `index.js` (API + conexao WhatsApp no mesmo processo).
 
-Este e o modo padrao do projeto e o usado por `npm start` (ideal para fase de testes com Lovable e deploy simples no Render).
+Este e o modo padrao do projeto e o usado por `npm start` (Instanzia + deploy simples no Render).
 
 ## Modo alternativo (futuro/escala)
 
@@ -19,7 +19,7 @@ Use este modo quando quiser escalar para maior volume de sessoes e processamento
 1. Copie `.env.example` para `.env`
 2. Defina uma `API_KEY` forte
 3. (Opcional) Defina `CORS_ORIGIN` com a URL do frontend
-4. (Opcional) Defina `LOVABLE_EVENTS_URL` e `LOVABLE_WEBHOOK_SECRET` para receber eventos
+4. (Opcional) Defina `INSTANZIA_EVENTS_URL` e `INSTANZIA_WEBHOOK_SECRET` para receber eventos (ou as variaveis legado `LOVABLE_*`)
 
 ## Scripts
 
@@ -47,13 +47,15 @@ Rotas protegidas exigem header:
 
 ## Endpoints (modo oficial)
 
-- `GET /health` (sem auth)
+- `GET /health` (com `x-api-key`, como as demais rotas do modo oficial)
 - `GET /start?session=nome_sessao` (com auth)
 - `GET /qr?session=nome_sessao` (com auth)
 - `POST /send` (com auth)
 - `DELETE /session?session=nome_sessao` (com auth)
 
 ### Payload `/send`
+
+**Texto**
 
 ```json
 {
@@ -63,6 +65,47 @@ Rotas protegidas exigem header:
 }
 ```
 
+**Imagem (base64)** — defina `JSON_BODY_LIMIT` no servidor se o arquivo for grande.
+
+```json
+{
+  "session": "cliente_1",
+  "numero": "5511999999999",
+  "tipo": "image",
+  "mimeType": "image/jpeg",
+  "arquivoBase64": "<base64 ou data:image/jpeg;base64,...>",
+  "caption": "opcional"
+}
+```
+
+**Documento por URL** — no Render, defina `MEDIA_FETCH_ALLOWED_HOSTS` com o host do arquivo (apenas HTTPS).
+
+```json
+{
+  "session": "cliente_1",
+  "numero": "5511999999999",
+  "tipo": "document",
+  "url": "https://cdn.exemplo.com/arquivo.pdf",
+  "mimeType": "application/pdf",
+  "nomeArquivo": "proposta.pdf"
+}
+```
+
+**Mensagem de voz (PTT)**
+
+```json
+{
+  "session": "cliente_1",
+  "numero": "5511999999999",
+  "tipo": "audio",
+  "ptt": true,
+  "mimeType": "audio/ogg",
+  "arquivoBase64": "<base64>"
+}
+```
+
+Tipos suportados: `text` (default), `image`, `video`, `audio`, `document`. Ver `CONTEXT.md` para limites e seguranca.
+
 ## Fluxo recomendado
 
 1. Chamar `GET /start?session=<id_cliente>`
@@ -70,7 +113,7 @@ Rotas protegidas exigem header:
 3. Aguardar conexao da sessao
 4. Chamar `POST /send` para envio de mensagem
 
-## Observacao para Render + Lovable
+## Observacao para Render + Instanzia
 
-- Se continuar usando `npm start`, o comportamento atual nao muda.
+- Com `npm start`, o servico e o `index.js` descrito acima.
 - Alteracoes no modo alternativo (`api.js` + `worker.js`) nao afetam o fluxo atual enquanto voce nao trocar o comando de inicializacao/deploy.

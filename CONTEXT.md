@@ -14,6 +14,13 @@ Backend Node.js (**Express + Baileys** `@whiskeysockets/baileys`) para WhatsApp 
 
 **Vários usuários:** cada login pode ter sessões novas (histórias isoladas). O `index.js` **não impõe** teto de instâncias; um limite (ex.: 15 clientes) é **regra de produto** no Instanzia ou, se desejado, uma validação futura no `/start`. Várias sessões no mesmo processo aumentam RAM/CPU.
 
+### Integração “plug and play” (site externo, ex. Le Chef)
+
+- **`INSTANZIA_EVENTS_URL`** (ex. `…/whatsapp-events`) é **entrada de eventos**: o **Render** faz POST **para** o Instanzia. **Não** é o endpoint público para o site do cliente **enviar** mensagem.
+- **Envio** para o WhatsApp no motor atual: **`POST https://<render>/send`** com **`x-api-key`** = `API_KEY` do Render e body `session` + `numero` + `mensagem` (ver secção API).
+- Para o **comprador final** não mexer com `API_KEY` do Render: implementar no **Instanzia** (Lovable) uma **API pública** (edge function) que valida chave tipo `cfy_…` + instância no banco e **reencaminha** para o Render **só no servidor** (secret), como no Le Chef.
+- **Nunca** colocar `API_KEY` do Render nem segredos em código de página que roda no browser.
+
 ---
 
 ## Dois modos no repositório
@@ -123,6 +130,8 @@ Em **`connection === "close"`** com **401**, o servidor remove sessão e **`clea
 - **`515`:** “restart required” (comum após pareamento); reconexão rápida configurável (`RECONNECT_RESTART_REQUIRED_MS`).
 - **`428`** com *Connection Terminated* (ou mensagem equivalente): encerramento do **WebSocket** pelo WhatsApp ou rede; em geral **transitório** — o serviço agenda reconexão. Causa raiz exata raramente vem além do código/mensagem; correlacionar com deploy no Render ou instabilidade de rede.
 
+**Logs verbosos do Baileys:** mensagens com `SessionEntry`, ratchet, `chainKey`, buffers etc. costumam ser **criptografia Signal** (rotação de sessão), comuns após envio — **não** indicam por si só falha de entrega. Linhas `url generation failed` podem ser internas (mídia/URL); se texto entrega ok, muitas vezes é ruído. Preocupar-se com `lastDisconnect`, **401** e falhas reais no `/send`.
+
 ---
 
 ## Comportamento esperado (operacional)
@@ -133,7 +142,9 @@ Em **`connection === "close"`** com **401**, o servidor remove sessão e **`clea
 
 ### Múltiplos webhooks por instância
 
-**Não implementado.** Hoje uma URL global. Evolução: fan-out no `.env` ou URLs por sessão.
+**Neste repo:** uma URL global (`INSTANZIA_EVENTS_URL`) — **um** POST por evento saindo do Render.
+
+**No produto Instanzia (até 3 URLs por instância):** o fan-out (replicar o mesmo evento para 2–3 destinos) deve ficar **no Instanzia** após receber o POST. Assim a carga do Render **não** multiplica com o número de webhooks. Só pesaria o Render se o backend fosse alterado para disparar vários POSTs por evento.
 
 ---
 
@@ -148,6 +159,7 @@ Em **`connection === "close"`** com **401**, o servidor remove sessão e **`clea
 
 ## Histórico já registrado neste repo
 
+- Fluxo **plug and play** documentado: eventos → `INSTANZIA_EVENTS_URL`; envio público → edge Instanzia + secret; fan-out de webhooks → **Instanzia**, não multiplicar POSTs no Render.
 - `POST /send` com **mídia** (base64 ou URL com allowlist), limites `JSON_BODY_LIMIT` / `MEDIA_MAX_BYTES`.
 - **Fila por sessão** em `/send` com `SEND_MIN_INTERVAL_MS` (default 5 s entre envios).
 - Eco **`messages.upsert`** com `source: "api_send"` para métricas de envio.
@@ -156,11 +168,11 @@ Em **`connection === "close"`** com **401**, o servidor remove sessão e **`clea
 
 ### Retomada sugerida (próxima sessão de trabalho)
 
-- Instanzia: UI de **logs de webhooks** (se ainda não implementado) e campanhas respeitando **fila + UX de progresso** (vários `POST /send` na mesma sessão esperam na fila no servidor).
+- Instanzia: página **Integração** (chave `cfy_…` + instância + exemplo tipo Le Chef), API edge que repassa para o Render com secret; **logs de webhooks** na UI; campanhas com **fila + UX de progresso**.
 - Opcional: alinhar **`api.js` / `worker.js`** com fila de envio e mesmo contrato de mídia do monólito, se o deploy migrar do `index.js`.
 
 ---
 
-*Última revisão deste arquivo: 2026-05-14 (fila `/send`, desconexões, monólito vs worker).*
+*Última revisão deste arquivo: 2026-05-20 (integração plug and play, fan-out webhooks, logs Baileys).*
 
 *Pedir explicitamente “ler `CONTEXT.md`” em chats novos após clone, se o time usar essa convenção.*

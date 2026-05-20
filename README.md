@@ -51,7 +51,8 @@ Rotas protegidas exigem header:
 - `GET /start?session=nome_sessao` (com auth)
 - `GET /qr?session=nome_sessao` (com auth)
 - `POST /send` (com auth)
-- `DELETE /session?session=nome_sessao` (com auth)
+- `POST /disconnect?session=nome_sessao` (com auth) — desconecta sem apagar login salvo
+- `DELETE /session?session=nome_sessao` (com auth) — remove instância e apaga credenciais (novo QR)
 
 ### Payload `/send`
 

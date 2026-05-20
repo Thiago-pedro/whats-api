@@ -83,7 +83,8 @@ Todas as rotas abaixo exigem **`x-api-key`** (incluindo **`GET /health`**).
 | `POST` | `/warmup?session=` | Boot rápido; `{ warming \| alreadyRunning }`. |
 | `POST` | `/send` | Texto e **mídia**; **fila por `session`** se `SEND_MIN_INTERVAL_MS` > 0 (ver secção abaixo). |
 | `GET` | `/qr?session=&wait=N` | Long-poll JSON; sem `wait`, **JSON por default**; HTML só com `format=html`. |
-| `DELETE` | `/session?session=` | Remove sessão em memória **e** limpa pasta auth no disco. |
+| `GET` / `POST` | `/disconnect?session=` | **Pausa** conexão (fecha socket); **mantém** credenciais em `auth/` — reconectar com `/start` sem `force` evita novo QR (estilo Zapster). |
+| `DELETE` | `/session?session=` | Remove sessão **e** apaga credenciais (exige novo QR). Não usar no botão “Desconectar” do painel. |
 | `GET` | `/events?session=` | SSE (opcional). |
 | `GET` | `/health` | `{ ok, data: { status, uptimeSeconds, activeSessions } }`. |
 
@@ -159,6 +160,7 @@ Em **`connection === "close"`** com **401**, o servidor remove sessão e **`clea
 
 ## Histórico já registrado neste repo
 
+- **`POST /disconnect`:** desconectar manualmente sem apagar `auth/`; **`DELETE /session`** só para remover instância / novo QR.
 - Fluxo **plug and play** documentado: eventos → `INSTANZIA_EVENTS_URL`; envio público → edge Instanzia + secret; fan-out de webhooks → **Instanzia**, não multiplicar POSTs no Render.
 - `POST /send` com **mídia** (base64 ou URL com allowlist), limites `JSON_BODY_LIMIT` / `MEDIA_MAX_BYTES`.
 - **Fila por sessão** em `/send` com `SEND_MIN_INTERVAL_MS` (default 5 s entre envios).
@@ -173,6 +175,6 @@ Em **`connection === "close"`** com **401**, o servidor remove sessão e **`clea
 
 ---
 
-*Última revisão deste arquivo: 2026-05-20 (integração plug and play, fan-out webhooks, logs Baileys).*
+*Última revisão deste arquivo: 2026-05-20 (`/disconnect`, integração plug and play, fan-out webhooks).*
 
 *Pedir explicitamente “ler `CONTEXT.md`” em chats novos após clone, se o time usar essa convenção.*

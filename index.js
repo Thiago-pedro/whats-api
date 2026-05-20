@@ -466,7 +466,10 @@ async function emitOutboundUpsertForCounters(sessionId, remoteJid, sent, { text,
     })
 }
 
-app.use(["/start", "/send", "/qr", "/session", "/warmup", "/health", "/events"], authMiddleware)
+app.use(
+    ["/start", "/send", "/qr", "/session", "/disconnect", "/warmup", "/health", "/events"],
+    authMiddleware
+)
 
 const sessions = {}
 /** Fila por sessão: garante intervalo mínimo entre cada `sendMessage` (disparos em massa). */
@@ -535,6 +538,23 @@ function resetSession(sessionId) {
     spacedSendTailBySession.delete(sessionId)
     delete sessions[sessionId]
     return true
+}
+
+/** Desconecta sem apagar credenciais em disco — reconectar com POST /start (sem force) evita novo QR. */
+function disconnectSessionKeepAuth(sessionId) {
+    const existing = sessions[sessionId]
+    if (!existing) {
+        return { hadActiveSession: false }
+    }
+    if (existing.reconnectTimerId) {
+        clearTimeout(existing.reconnectTimerId)
+        existing.reconnectTimerId = null
+    }
+    qrWaiters.delete(sessionId)
+    spacedSendTailBySession.delete(sessionId)
+    delete sessions[sessionId]
+    closeSocketSafely(existing.sock)
+    return { hadActiveSession: true }
 }
 
 /**
@@ -888,6 +908,33 @@ app.post("/warmup", (req, res) => {
     })
 })
 
+function handleDisconnect(req, res) {
+    const sessionId = req.query.session?.toString()
+
+    if (!isValidSessionId(sessionId)) {
+        return sendError(res, 400, "session invalida")
+    }
+
+    const { hadActiveSession } = disconnectSessionKeepAuth(sessionId)
+    const credentialsPreserved = fs.existsSync(authStateDir(sessionId))
+
+    if (!hadActiveSession && !credentialsPreserved) {
+        return sendError(res, 404, "sessao nao encontrada")
+    }
+
+    return sendSuccess(res, 200, {
+        message: hadActiveSession ? "desconectada" : "ja estava desconectada",
+        session: sessionId,
+        credentialsPreserved,
+        reconnectHint: credentialsPreserved
+            ? "use POST /start?session=... sem force=1 para reconectar sem novo QR"
+            : "credenciais ausentes; sera necessario parear com QR"
+    })
+}
+
+app.post("/disconnect", handleDisconnect)
+app.get("/disconnect", handleDisconnect)
+
 app.delete("/session", (req, res) => {
     const sessionId = req.query.session?.toString()
 
@@ -898,14 +945,18 @@ app.delete("/session", (req, res) => {
     qrWaiters.delete(sessionId)
     const removed = resetSession(sessionId)
     if (!removed) {
-        return sendError(res, 404, "sessao nao encontrada")
+        clearAuthState(sessionId)
+        if (!fs.existsSync(authStateDir(sessionId))) {
+            return sendError(res, 404, "sessao nao encontrada")
+        }
+    } else {
+        clearAuthState(sessionId)
     }
-
-    clearAuthState(sessionId)
 
     return sendSuccess(res, 200, {
         message: "sessao removida",
-        session: sessionId
+        session: sessionId,
+        credentialsRemoved: true
     })
 })
 

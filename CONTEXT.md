@@ -84,7 +84,17 @@ Todas as rotas abaixo exigem **`x-api-key`** (incluindo **`GET /health`**).
 | `POST` | `/send` | Texto e **mídia**; **fila por `session`** se `SEND_MIN_INTERVAL_MS` > 0 (ver secção abaixo). |
 | `GET` | `/qr?session=&wait=N` | Long-poll JSON; sem `wait`, **JSON por default**; HTML só com `format=html`. |
 | `GET` / `POST` | `/disconnect?session=` | **Pausa** conexão (fecha socket); **mantém** credenciais em `auth/` — reconectar com `/start` sem `force` evita novo QR (estilo Zapster). |
-| `DELETE` | `/session?session=` | Remove sessão **e** apaga credenciais (exige novo QR). Não usar no botão “Desconectar” do painel. |
+| `DELETE` | `/session?session=` | Remove sessão **e** apaga credenciais (exige novo QR). **Não** usar no botão “Desconectar” do painel. |
+
+### Botões do painel Instanzia (Lovable) × rotas Render
+
+| Ação no UI | Rota correta | Errado (evitar) |
+|------------|--------------|-----------------|
+| **Desconectar** (pausar) | `POST /disconnect?session=` | `DELETE /session` (apaga login → obriga QR) |
+| **Conectar / Reconectar** | `POST /start?session=` **sem** `force=1` | `force=1` sem intenção de novo pareamento |
+| **Remover instância / Novo QR** | `DELETE /session` ou `/start?force=1` | Usar em “Desconectar” |
+
+Resposta típica **`/disconnect` (200):** `{ ok: true, data: { message, session, credentialsPreserved, reconnectHint } }`. O `disconnect` cancela timer de reconexão automática e remove a sessão só da RAM; credenciais ficam em `WHATSAPP_AUTH_ROOT/<sessionId>/`.
 | `GET` | `/events?session=` | SSE (opcional). |
 | `GET` | `/health` | `{ ok, data: { status, uptimeSeconds, activeSessions } }`. |
 
@@ -133,11 +143,20 @@ Em **`connection === "close"`** com **401**, o servidor remove sessão e **`clea
 
 **Logs verbosos do Baileys:** mensagens com `SessionEntry`, ratchet, `chainKey`, buffers etc. costumam ser **criptografia Signal** (rotação de sessão), comuns após envio — **não** indicam por si só falha de entrega. Linhas `url generation failed` podem ser internas (mídia/URL); se texto entrega ok, muitas vezes é ruído. Preocupar-se com `lastDisconnect`, **401** e falhas reais no `/send`.
 
+**`timed out waiting for message` (level 40):** comum no Render com pouca RAM ou após notificações de histórico (`got history notification`). Pode levar a `connection closed` e `lastDisconnect` com `statusCode`/`reason` **null**. Conferir que **`WHATSAPP_SYNC_HISTORY` não está ativo** no Render (default do código: histórico desligado). Mitigação operacional: `POST /disconnect` → aguardar alguns segundos → `POST /start` sem `force`; se repetir, `DELETE /session` + novo QR.
+
+### UI presa em “Reconectando…” (Instanzia)
+
+- O backend, após `connection === "close"` (exceto **401**), agenda **reconexão automática** com backoff (até ~60 s entre tentativas).
+- Se o `open` não chega (timeout/sync), o log mostra desconexão em loop mas o painel pode ficar em **“Reconectando…”** indefinidamente se só reagir ao `close` e não ao sucesso/falha final.
+- **Passos imediatos:** `POST /disconnect` (para o loop) → `POST /start` sem `force`. No log Render, sucesso = linha `✅ Sessão <id> conectada`.
+- **Lovable:** após N segundos em “Reconectando…”, oferecer “Tentar conectar de novo” ou voltar status para “Desconectada”; não zerar contadores RECEBIDAS/ENVIADAS nem `connected_at_first` em reconexão (ver retomada Instanzia).
+
 ---
 
 ## Comportamento esperado (operacional)
 
-- **Contadores / gráfico:** contar **`messages.upsert`** por `messageId` (dedupe), usando **`contentType` ou `text`** (mídia costuma ter `text` vazio).
+- **Contadores / gráfico:** contar **`messages.upsert`** por `messageId` (dedupe), usando **`contentType` ou `text`** (mídia costuma ter `text` vazio). Em queda **428** ou reconexão automática: **não** zerar contadores nem reiniciar timer acumulado no Supabase — só reset em remoção de instância / **401** / ação explícita do usuário.
 - **Card “Conectada”** vs **`activeSessions: 0`:** estado da UI costuma vir do **banco**; `/health` só conta RAM.
 - **`LOVABLE_EVENTS_URL` falhando** (deploys antigos): mesmo sintoma; migrar para **`INSTANZIA_EVENTS_URL`**.
 
@@ -170,11 +189,12 @@ Em **`connection === "close"`** com **401**, o servidor remove sessão e **`clea
 
 ### Retomada sugerida (próxima sessão de trabalho)
 
-- Instanzia: página **Integração** (chave `cfy_…` + instância + exemplo tipo Le Chef), API edge que repassa para o Render com secret; **logs de webhooks** na UI; campanhas com **fila + UX de progresso**.
+- Instanzia (Lovable): wire dos botões **`/disconnect`** vs **`/start`** vs **`DELETE /session`**; página **Integração** (`cfy_…` + instância + Le Chef); **logs de webhooks** na UI; campanhas com **fila + UX de progresso**; timeout em “Reconectando…”; persistência de contadores/timer em reconexão.
+- Opcional backend: limite máximo de tentativas de reconexão automática ou flag `isReconnect` no webhook `connection.update` (open).
 - Opcional: alinhar **`api.js` / `worker.js`** com fila de envio e mesmo contrato de mídia do monólito, se o deploy migrar do `index.js`.
 
 ---
 
-*Última revisão deste arquivo: 2026-05-20 (`/disconnect`, integração plug and play, fan-out webhooks).*
+*Última revisão deste arquivo: 2026-05-20 (`/disconnect`, reconexão/timeout, botões Instanzia, plug and play).*
 
 *Pedir explicitamente “ler `CONTEXT.md`” em chats novos após clone, se o time usar essa convenção.*
